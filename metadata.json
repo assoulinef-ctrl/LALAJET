@@ -1,0 +1,7 @@
+{
+  "name": "LalaJet Quote Manager",
+  "description": "High-end private aviation quote generation platform with modular cards, multi-language support, and interactive route mapping.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
