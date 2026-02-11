@@ -86,39 +86,41 @@ const App: React.FC = () => {
   // LOAD FROM SUPABASE
   // ==============================
 
-  useEffect(() => {
-    if (localStorage.getItem("lalajet_auth") === "1") {
-      setIsAuthenticated(true);
-    }
+ useEffect(() => {
+  if (localStorage.getItem("lalajet_auth") === "1") {
+    setIsAuthenticated(true);
+  }
 
-    if (!supabase) return;
+  if (!supabase) return;
 
-    const loadAll = async () => {
+  const loadAll = async () => {
 
-      // QUOTES
-      const { data: quotes } = await supabase.from('quotes').select('data');
-      if (quotes) setArchives(quotes.map(q => q.data));
+    const sb = supabase!; // 👈 ON FORCE TypeScript à comprendre que ce n’est pas null
 
-      // CLIENTS
-      const { data: clientsData } = await supabase.from('clients').select('data');
-      if (clientsData) setClients(clientsData.map(c => c.data));
+    // QUOTES
+    const { data: quotes } = await sb.from('quotes').select('data');
+    if (quotes) setArchives(quotes.map(q => q.data));
 
-      // CATALOG
-      const { data: catalogData } = await supabase.from('catalog_items').select('data');
-      if (catalogData) setCatalog(catalogData.map(c => c.data));
+    // CLIENTS
+    const { data: clientsData } = await sb.from('clients').select('data');
+    if (clientsData) setClients(clientsData.map(c => c.data));
 
-      // SETTINGS
-      const { data: settingsData } = await supabase
-        .from('settings')
-        .select('data')
-        .eq('id', 'global')
-        .single();
+    // CATALOG
+    const { data: catalogData } = await sb.from('catalog_items').select('data');
+    if (catalogData) setCatalog(catalogData.map(c => c.data));
 
-      if (settingsData?.data) setConfig(settingsData.data);
-    };
+    // SETTINGS
+    const { data: settingsData } = await sb
+      .from('settings')
+      .select('data')
+      .eq('id', 'global')
+      .single();
 
-    loadAll();
-  }, []);
+    if (settingsData?.data) setConfig(settingsData.data);
+  };
+
+  loadAll();
+}, []);
 
   // ==============================
   // SAVE EVERYTHING
