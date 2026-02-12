@@ -77,9 +77,6 @@ const createEmptyQuote = (): Quote => ({
 const SETTINGS_ROW_ID = "main";
 
 const App: React.FC = () => {
-  // ✅ Alias qui évite TS18047 (supabase possibly null) partout
-  const sb = supabase;
-
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
   const [passwordInput, setPasswordInput] = useState<string>("");
   const [loginError, setLoginError] = useState<string>("");
@@ -94,6 +91,11 @@ const App: React.FC = () => {
 
   const settingsSaveTimer = useRef<number | null>(null);
   const initialLoadDone = useRef<boolean>(false);
+  const realtimeDebounceTimer = useRef<number | null>(null);
+
+  const refreshAllFromSupabase = async () => {
+    await fetchFromSupabase();
+  };
 
   // --------- LOAD (localStorage + Supabase) ----------
   useEffect(() => {
@@ -125,7 +127,7 @@ const App: React.FC = () => {
       } catch {}
     }
 
-    // Supabase initial sync
+    const sb = supabase;
     if (sb) {
       fetchFromSupabase().finally(() => {
         initialLoadDone.current = true;
@@ -133,10 +135,11 @@ const App: React.FC = () => {
     } else {
       initialLoadDone.current = true;
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // --------- FETCH FROM SUPABASE (always replaces lists) ----------
   const fetchFromSupabase = async () => {
+    const sb = supabase;
     if (!sb) return;
 
     try {
@@ -153,39 +156,22 @@ const App: React.FC = () => {
 
       // 1) QUOTES
       const { data: quotesData } = await sb.from('quotes').select('data');
-      if (quotesData && quotesData.length > 0) {
-        const remoteQuotes = quotesData.map(q => q.data as Quote);
-        setArchives(prev => {
-          const combined = [...prev];
-          remoteQuotes.forEach((rq) => {
-            if (!combined.find(lq => lq.id === rq.id)) combined.push(rq);
-          });
-          return combined;
-        });
-      }
+      const remoteQuotes = (quotesData ?? []).map((q: any) => q.data as Quote);
+      setArchives(remoteQuotes);
 
       // 2) CLIENTS
       const { data: clientsData } = await sb.from('clients').select('data');
-      if (clientsData && clientsData.length > 0) {
-        const remoteClients = clientsData.map(c => c.data as Client);
-        setClients(prev => {
-          const combined = [...prev];
-          remoteClients.forEach((rc) => {
-            if (!combined.find(lc => lc.id === rc.id)) combined.push(rc);
-          });
-          return combined;
-        });
-      }
+      const remoteClients = (clientsData ?? []).map((c: any) => c.data as Client);
+      setClients(remoteClients);
 
       // 3) CATALOG
       const { data: catData, error: catError } = await sb.from('catalog_items').select('data');
       if (catError) {
-        console.error("[LalaJet] Catalog load error from Supabase:", catError.message);
-      } else if (catData && catData.length > 0) {
-        const remoteCat = catData.map(c => c.data as QuoteCard);
+        console.error("[LalaJet] Catalog load error:", catError.message);
+      } else {
+        const remoteCat = (catData ?? []).map((c: any) => c.data as QuoteCard);
         setCatalog(remoteCat);
       }
-
     } catch (err) {
       console.error("Supabase load error:", err);
     }
@@ -207,10 +193,10 @@ const App: React.FC = () => {
   // --------- SUPABASE AUTO SAVE FOR SETTINGS (CONFIG) ----------
   useEffect(() => {
     if (!isAuthenticated) return;
+    const sb = supabase;
     if (!sb) return;
     if (!initialLoadDone.current) return;
 
-    // debounce
     if (settingsSaveTimer.current) {
       window.clearTimeout(settingsSaveTimer.current);
     }
@@ -243,7 +229,46 @@ const App: React.FC = () => {
     return () => {
       if (settingsSaveTimer.current) window.clearTimeout(settingsSaveTimer.current);
     };
-  }, [config, isAuthenticated, sb]);
+  }, [config, isAuthenticated]);
+
+  // --------- REALTIME: sync deletions / imports / edits across browsers ----------
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    const sb = supabase;
+    if (!sb) return;
+
+    const scheduleRefresh = () => {
+      // petit debounce pour éviter 20 refresh si 20 lignes changent d’un coup
+      if (realtimeDebounceTimer.current) {
+        window.clearTimeout(realtimeDebounceTimer.current);
+      }
+      realtimeDebounceTimer.current = window.setTimeout(() => {
+        refreshAllFromSupabase();
+      }, 400);
+    };
+
+    const chQuotes = sb
+      .channel('rt-quotes')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'quotes' }, scheduleRefresh)
+      .subscribe();
+
+    const chClients = sb
+      .channel('rt-clients')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'clients' }, scheduleRefresh)
+      .subscribe();
+
+    const chCatalog = sb
+      .channel('rt-catalog')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'catalog_items' }, scheduleRefresh)
+      .subscribe();
+
+    return () => {
+      if (realtimeDebounceTimer.current) window.clearTimeout(realtimeDebounceTimer.current);
+      sb.removeChannel(chQuotes);
+      sb.removeChannel(chClients);
+      sb.removeChannel(chCatalog);
+    };
+  }, [isAuthenticated]);
 
   const handleLogin = (e: React.FormEvent) => {
     e.preventDefault();
@@ -308,7 +333,7 @@ const App: React.FC = () => {
         }
       });
 
-      // Supabase sync
+      const sb = supabase;
       if (sb) {
         setDbStatus("Supabase: sync...");
 
@@ -358,6 +383,7 @@ const App: React.FC = () => {
   const deleteQuote = async (id: string) => {
     if (confirm('Supprimer ce devis définitivement ?')) {
       setArchives(prev => (Array.isArray(prev) ? prev : []).filter(a => a.id !== id));
+      const sb = supabase;
       if (sb) {
         await sb.from('quotes').delete().eq('id', id);
       }
