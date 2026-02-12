@@ -1,4 +1,3 @@
-console.log("SUPABASE OBJECT:", supabase);
 import React, { useState, useEffect, useRef } from 'react';
 import { QuoteEditor } from './components/QuoteEditor';
 import { CatalogManager } from './components/CatalogManager';
@@ -77,7 +76,14 @@ const createEmptyQuote = (): Quote => ({
 
 const SETTINGS_ROW_ID = "main";
 
+/** Helpers "blindés" */
+const safeJsonClone = <T,>(obj: T): T => JSON.parse(JSON.stringify(obj));
+const ensureId = (id?: string) => id && id.trim().length > 0 ? id : `id-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+
 const App: React.FC = () => {
+  // Alias "type-safe": si on a vérifié sb, TS arrête d'hurler
+  const sb = supabase;
+
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
   const [passwordInput, setPasswordInput] = useState<string>("");
   const [loginError, setLoginError] = useState<string>("");
@@ -90,190 +96,126 @@ const App: React.FC = () => {
   const [clients, setClients] = useState<Client[]>([]);
   const [config, setConfig] = useState<CompanyConfig>(DEFAULT_CONFIG);
 
+  // timers / guards
+  const settingsSaveTimer = useRef<number | null>(null);
+  const clientsSaveTimer = useRef<number | null>(null);
+  const catalogSaveTimer = useRef<number | null>(null);
+
   const initialLoadDone = useRef<boolean>(false);
 
-  // refs pour détecter ce qui a été supprimé (pour delete en DB)
-  const prevClientsRef = useRef<Client[]>([]);
-  const prevCatalogRef = useRef<QuoteCard[]>([]);
-  const prevArchivesRef = useRef<Quote[]>([]);
+  // For delete detection
+  const prevClientIds = useRef<Set<string>>(new Set());
+  const prevCatalogIds = useRef<Set<string>>(new Set());
 
-  // debounce timers
-  const clientsSyncTimer = useRef<number | null>(null);
-  const catalogSyncTimer = useRef<number | null>(null);
-  const quotesSyncTimer = useRef<number | null>(null);
-  const settingsSyncTimer = useRef<number | null>(null);
-
-  // -------------------- LOAD LOCAL + SUPABASE --------------------
+  // --------- LOAD (localStorage + Supabase) ----------
   useEffect(() => {
     if (localStorage.getItem("lalajet_auth") === "1") {
       setIsAuthenticated(true);
     }
 
+    // Local load
     const savedConfig = localStorage.getItem('lalajet_config');
     const savedCatalog = localStorage.getItem('lalajet_catalog');
     const savedClients = localStorage.getItem('lalajet_clients');
     const savedArchives = localStorage.getItem('lalajet_archives');
 
-    if (savedConfig) { try { setConfig(JSON.parse(savedConfig)); } catch {} }
-    if (savedCatalog) { try { setCatalog(JSON.parse(savedCatalog)); } catch {} }
-    if (savedClients) { try { const p = JSON.parse(savedClients); if (Array.isArray(p)) setClients(p); } catch {} }
-    if (savedArchives) { try { const p = JSON.parse(savedArchives); if (Array.isArray(p)) setArchives(p); } catch {} }
-
-    const load = async () => {
-      if (!supabase) {
-        initialLoadDone.current = true;
-        return;
-      }
-
+    if (savedConfig) {
+      try { setConfig(JSON.parse(savedConfig)); } catch {}
+    }
+    if (savedCatalog) {
+      try { setCatalog(JSON.parse(savedCatalog)); } catch {}
+    }
+    if (savedClients) {
       try {
-        // SETTINGS
-        const { data: settingsData } = await supabase
-          .from('settings')
-          .select('data')
-          .eq('id', SETTINGS_ROW_ID)
-          .maybeSingle();
+        const parsed = JSON.parse(savedClients);
+        if (Array.isArray(parsed)) setClients(parsed);
+      } catch {}
+    }
+    if (savedArchives) {
+      try {
+        const parsed = JSON.parse(savedArchives);
+        if (Array.isArray(parsed)) setArchives(parsed);
+      } catch {}
+    }
 
-        if (settingsData?.data) setConfig(settingsData.data as CompanyConfig);
-
-        // QUOTES
-        const { data: quotesData } = await supabase.from('quotes').select('data');
-        if (quotesData?.length) {
-          const remote = quotesData.map(q => q.data as Quote);
-          setArchives(remote);
-        }
-
-        // CLIENTS
-        const { data: clientsData } = await supabase.from('clients').select('data');
-        if (clientsData?.length) {
-          const remote = clientsData.map(c => c.data as Client);
-          setClients(remote);
-        }
-
-        // CATALOG
-        const { data: catData } = await supabase.from('catalog_items').select('data');
-        if (catData?.length) {
-          const remote = catData.map(c => c.data as QuoteCard);
-          setCatalog(remote);
-        }
-      } catch (e) {
-        console.error("Supabase initial load error:", e);
-      } finally {
+    // Supabase initial sync
+    if (sb) {
+      fetchFromSupabase().finally(() => {
         initialLoadDone.current = true;
-      }
-    };
-
-    load();
+        // set baseline ids after first load
+        prevClientIds.current = new Set((clients || []).map(c => c.id));
+        prevCatalogIds.current = new Set((catalog || []).map((i: any) => i.id));
+      });
+    } else {
+      initialLoadDone.current = true;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // -------------------- REALTIME (MULTI-SESSION) --------------------
-  useEffect(() => {
-    if (!supabase) return;
-    if (!isAuthenticated) return;
-    if (!initialLoadDone.current) return;
+  const fetchFromSupabase = async () => {
+    if (!sb) return;
 
-    const channel = supabase.channel('lalajet-realtime-all');
+    try {
+      // 0) SETTINGS (CONFIG)
+      const { data: settingsData } = await sb
+        .from('settings')
+        .select('data')
+        .eq('id', SETTINGS_ROW_ID)
+        .maybeSingle();
 
-    // CLIENTS
-    channel.on(
-      'postgres_changes',
-      { event: '*', schema: 'public', table: 'clients' },
-      (payload: any) => {
-        const newRow = payload.new?.data as Client | undefined;
-        const oldRow = payload.old?.data as Client | undefined;
-
-        if (payload.eventType === 'INSERT' || payload.eventType === 'UPDATE') {
-          if (!newRow?.id) return;
-          setClients(prev => {
-            const list = Array.isArray(prev) ? prev : [];
-            const idx = list.findIndex(c => c.id === newRow.id);
-            if (idx >= 0) {
-              const copy = [...list];
-              copy[idx] = newRow;
-              return copy;
-            }
-            return [...list, newRow];
-          });
-        }
-
-        if (payload.eventType === 'DELETE') {
-          const id = payload.old?.id || oldRow?.id;
-          if (!id) return;
-          setClients(prev => (Array.isArray(prev) ? prev : []).filter(c => c.id !== id));
-        }
+      if (settingsData?.data) {
+        setConfig(settingsData.data as CompanyConfig);
       }
-    );
 
-    // CATALOG
-    channel.on(
-      'postgres_changes',
-      { event: '*', schema: 'public', table: 'catalog_items' },
-      (payload: any) => {
-        const newRow = payload.new?.data as QuoteCard | undefined;
-        const oldRow = payload.old?.data as QuoteCard | undefined;
+      // 1) QUOTES
+      const { data: quotesRows } = await sb
+        .from('quotes')
+        .select('id,data,updated_at');
 
-        if (payload.eventType === 'INSERT' || payload.eventType === 'UPDATE') {
-          if (!newRow?.id) return;
-          setCatalog(prev => {
-            const list = Array.isArray(prev) ? prev : [];
-            const idx = list.findIndex(i => i.id === newRow.id);
-            if (idx >= 0) {
-              const copy = [...list];
-              copy[idx] = newRow;
-              return copy;
-            }
-            return [...list, newRow];
+      if (quotesRows && quotesRows.length > 0) {
+        const remoteQuotes = quotesRows
+          .map(r => r.data as Quote)
+          .filter(Boolean);
+
+        setArchives(prev => {
+          const local = Array.isArray(prev) ? [...prev] : [];
+          remoteQuotes.forEach((rq) => {
+            if (!local.find(lq => lq.id === rq.id)) local.push(rq);
           });
-        }
-
-        if (payload.eventType === 'DELETE') {
-          const id = payload.old?.id || oldRow?.id;
-          if (!id) return;
-          setCatalog(prev => (Array.isArray(prev) ? prev : []).filter(i => i.id !== id));
-        }
+          return local;
+        });
       }
-    );
 
-    // QUOTES
-    channel.on(
-      'postgres_changes',
-      { event: '*', schema: 'public', table: 'quotes' },
-      (payload: any) => {
-        const newRow = payload.new?.data as Quote | undefined;
-        const oldRow = payload.old?.data as Quote | undefined;
+      // 2) CLIENTS
+      const { data: clientsRows } = await sb
+        .from('clients')
+        .select('id,data,updated_at');
 
-        if (payload.eventType === 'INSERT' || payload.eventType === 'UPDATE') {
-          if (!newRow?.id) return;
-          setArchives(prev => {
-            const list = Array.isArray(prev) ? prev : [];
-            const idx = list.findIndex(q => q.id === newRow.id);
-            if (idx >= 0) {
-              const copy = [...list];
-              copy[idx] = newRow;
-              return copy;
-            }
-            return [...list, newRow];
-          });
-        }
-
-        if (payload.eventType === 'DELETE') {
-          const id = payload.old?.id || oldRow?.id;
-          if (!id) return;
-          setArchives(prev => (Array.isArray(prev) ? prev : []).filter(q => q.id !== id));
-        }
+      if (clientsRows && clientsRows.length > 0) {
+        const remoteClients = clientsRows.map(r => r.data as Client).filter(Boolean);
+        setClients(remoteClients);
+        prevClientIds.current = new Set(remoteClients.map(c => c.id));
       }
-    );
 
-    channel.subscribe((status) => {
-      // tu peux laisser silencieux
-      // console.log("Realtime:", status);
-    });
+      // 3) CATALOG
+      const { data: catRows } = await sb
+        .from('catalog_items')
+        .select('id,data,updated_at');
 
-    return () => {
-      supabase.removeChannel(channel);
-    };
-  }, [isAuthenticated]);
+      if (catRows && catRows.length > 0) {
+        const remoteCat = catRows.map(r => r.data as QuoteCard).filter(Boolean);
+        // ensure stable ids
+        const normalized = remoteCat.map((it: any) => ({ ...it, id: ensureId(it.id) }));
+        setCatalog(normalized);
+        prevCatalogIds.current = new Set(normalized.map((i: any) => i.id));
+      }
 
-  // -------------------- LOCAL STORAGE AUTO SAVE --------------------
+    } catch (err) {
+      console.error("[LalaJet] Supabase load error:", err);
+    }
+  };
+
+  // --------- LOCAL STORAGE AUTO SAVE ----------
   useEffect(() => {
     if (!isAuthenticated) return;
     try {
@@ -282,22 +224,22 @@ const App: React.FC = () => {
       localStorage.setItem('lalajet_clients', JSON.stringify(clients));
       localStorage.setItem('lalajet_archives', JSON.stringify(archives));
     } catch (e) {
-      console.error("LocalStorage error", e);
+      console.error("[LalaJet] LocalStorage error", e);
     }
   }, [config, catalog, clients, archives, isAuthenticated]);
 
-  // -------------------- SETTINGS AUTO SAVE (CONFIG) --------------------
+  // --------- SUPABASE AUTO SAVE FOR SETTINGS (CONFIG) ----------
   useEffect(() => {
     if (!isAuthenticated) return;
-    if (!supabase) return;
+    if (!sb) return;
     if (!initialLoadDone.current) return;
 
-    if (settingsSyncTimer.current) window.clearTimeout(settingsSyncTimer.current);
+    if (settingsSaveTimer.current) window.clearTimeout(settingsSaveTimer.current);
 
-    settingsSyncTimer.current = window.setTimeout(async () => {
+    settingsSaveTimer.current = window.setTimeout(async () => {
       try {
         setDbStatus("Config: sync...");
-        const { error } = await supabase
+        const { error } = await sb
           .from('settings')
           .upsert({
             id: SETTINGS_ROW_ID,
@@ -306,156 +248,227 @@ const App: React.FC = () => {
           });
 
         if (error) {
-          console.error("Settings upsert error:", error.message);
+          console.error("[LalaJet] Settings upsert error:", error.message);
           setDbStatus("Config: ERROR");
         } else {
           setDbStatus("Config: saved ✅");
         }
-        setTimeout(() => setDbStatus(""), 2500);
+        setTimeout(() => setDbStatus(""), 1800);
       } catch (e) {
-        console.error("Settings save crash:", e);
+        console.error("[LalaJet] Settings save crash:", e);
         setDbStatus("Config: ERROR");
-        setTimeout(() => setDbStatus(""), 2500);
-      }
-    }, 600);
-
-    return () => {
-      if (settingsSyncTimer.current) window.clearTimeout(settingsSyncTimer.current);
-    };
-  }, [config, isAuthenticated]);
-
-  // -------------------- CLIENTS AUTO SYNC (ADD/UPDATE/DELETE) --------------------
-  useEffect(() => {
-    if (!isAuthenticated) return;
-    if (!supabase) return;
-    if (!initialLoadDone.current) return;
-
-    if (clientsSyncTimer.current) window.clearTimeout(clientsSyncTimer.current);
-
-    clientsSyncTimer.current = window.setTimeout(async () => {
-      try {
-        const prev = prevClientsRef.current || [];
-        const curr = Array.isArray(clients) ? clients : [];
-
-        // détecte les supprimés
-        const prevIds = new Set(prev.map(c => c.id));
-        const currIds = new Set(curr.map(c => c.id));
-        const removed = [...prevIds].filter(id => !currIds.has(id));
-
-        // delete en DB pour ne plus ré-apparaître ailleurs
-        for (const id of removed) {
-          await supabase.from('clients').delete().eq('id', id);
-        }
-
-        // upsert tout (simple et robuste)
-        if (curr.length > 0) {
-          await supabase.from('clients').upsert(
-            curr.map(c => ({
-              id: c.id,
-              data: c,
-              updated_at: new Date().toISOString()
-            }))
-          );
-        }
-
-        prevClientsRef.current = curr;
-      } catch (e) {
-        console.error("Clients sync error:", e);
-      }
-    }, 500);
-
-    return () => {
-      if (clientsSyncTimer.current) window.clearTimeout(clientsSyncTimer.current);
-    };
-  }, [clients, isAuthenticated]);
-
-  // -------------------- CATALOG AUTO SYNC (ADD/UPDATE/DELETE) --------------------
-  useEffect(() => {
-    if (!isAuthenticated) return;
-    if (!supabase) return;
-    if (!initialLoadDone.current) return;
-
-    if (catalogSyncTimer.current) window.clearTimeout(catalogSyncTimer.current);
-
-    catalogSyncTimer.current = window.setTimeout(async () => {
-      try {
-        const prev = prevCatalogRef.current || [];
-        const curr = Array.isArray(catalog) ? catalog : [];
-
-        const prevIds = new Set(prev.map(i => i.id));
-        const currIds = new Set(curr.map(i => i.id));
-        const removed = [...prevIds].filter(id => !currIds.has(id));
-
-        for (const id of removed) {
-          await supabase.from('catalog_items').delete().eq('id', id);
-        }
-
-        if (curr.length > 0) {
-          await supabase.from('catalog_items').upsert(
-            curr.map(i => ({
-              id: i.id,
-              data: i,
-              updated_at: new Date().toISOString()
-            }))
-          );
-        }
-
-        prevCatalogRef.current = curr;
-      } catch (e) {
-        console.error("Catalog sync error:", e);
-      }
-    }, 500);
-
-    return () => {
-      if (catalogSyncTimer.current) window.clearTimeout(catalogSyncTimer.current);
-    };
-  }, [catalog, isAuthenticated]);
-
-  // -------------------- QUOTES AUTO SYNC (DELETE + UPDATE) --------------------
-  // (Ça évite qu'un devis supprimé dans une session revienne dans l'autre)
-  useEffect(() => {
-    if (!isAuthenticated) return;
-    if (!supabase) return;
-    if (!initialLoadDone.current) return;
-
-    if (quotesSyncTimer.current) window.clearTimeout(quotesSyncTimer.current);
-
-    quotesSyncTimer.current = window.setTimeout(async () => {
-      try {
-        const prev = prevArchivesRef.current || [];
-        const curr = Array.isArray(archives) ? archives : [];
-
-        const prevIds = new Set(prev.map(q => q.id));
-        const currIds = new Set(curr.map(q => q.id));
-        const removed = [...prevIds].filter(id => !currIds.has(id));
-
-        for (const id of removed) {
-          await supabase.from('quotes').delete().eq('id', id);
-        }
-
-        // on upsert ce que tu as en local (robuste)
-        if (curr.length > 0) {
-          await supabase.from('quotes').upsert(
-            curr.map(q => ({
-              id: q.id,
-              data: q,
-              updated_at: new Date().toISOString()
-            }))
-          );
-        }
-
-        prevArchivesRef.current = curr;
-      } catch (e) {
-        console.error("Quotes sync error:", e);
+        setTimeout(() => setDbStatus(""), 1800);
       }
     }, 700);
 
     return () => {
-      if (quotesSyncTimer.current) window.clearTimeout(quotesSyncTimer.current);
+      if (settingsSaveTimer.current) window.clearTimeout(settingsSaveTimer.current);
     };
-  }, [archives, isAuthenticated]);
+  }, [config, isAuthenticated, sb]);
 
-  // -------------------- AUTH --------------------
+  // --------- SUPABASE AUTO SYNC FOR CLIENTS (ADD/EDIT/DELETE) ----------
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    if (!sb) return;
+    if (!initialLoadDone.current) return;
+
+    if (clientsSaveTimer.current) window.clearTimeout(clientsSaveTimer.current);
+
+    clientsSaveTimer.current = window.setTimeout(async () => {
+      try {
+        // normalize ids
+        const normalized = (clients || []).map(c => ({ ...c, id: ensureId(c.id) }));
+        if (normalized.some((c, i) => c.id !== (clients[i]?.id))) {
+          setClients(normalized);
+          return; // next effect will sync
+        }
+
+        // detect deletions
+        const currentIds = new Set(normalized.map(c => c.id));
+        const deletedIds = [...prevClientIds.current].filter(id => !currentIds.has(id));
+
+        // upsert all (simple + safe)
+        if (normalized.length > 0) {
+          await Promise.all(
+            normalized.map(c =>
+              sb.from('clients').upsert({
+                id: c.id,
+                data: c,
+                updated_at: new Date().toISOString()
+              })
+            )
+          );
+        }
+
+        // delete removed
+        if (deletedIds.length > 0) {
+          await sb.from('clients').delete().in('id', deletedIds);
+        }
+
+        prevClientIds.current = currentIds;
+      } catch (e) {
+        console.error("[LalaJet] Clients sync error:", e);
+      }
+    }, 650);
+
+    return () => {
+      if (clientsSaveTimer.current) window.clearTimeout(clientsSaveTimer.current);
+    };
+  }, [clients, isAuthenticated, sb]);
+
+  // --------- SUPABASE AUTO SYNC FOR CATALOG (ADD/EDIT/DELETE) ----------
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    if (!sb) return;
+    if (!initialLoadDone.current) return;
+
+    if (catalogSaveTimer.current) window.clearTimeout(catalogSaveTimer.current);
+
+    catalogSaveTimer.current = window.setTimeout(async () => {
+      try {
+        // normalize ids
+        const normalized = (catalog || []).map((it: any) => ({ ...it, id: ensureId(it.id) }));
+        const changedId = normalized.some((it: any, i: number) => it.id !== (catalog[i] as any)?.id);
+        if (changedId) {
+          setCatalog(normalized);
+          return; // next effect will sync
+        }
+
+        const currentIds = new Set(normalized.map((i: any) => i.id));
+        const deletedIds = [...prevCatalogIds.current].filter(id => !currentIds.has(id));
+
+        if (normalized.length > 0) {
+          await Promise.all(
+            normalized.map((item: any) =>
+              sb.from('catalog_items').upsert({
+                id: item.id,
+                data: item,
+                updated_at: new Date().toISOString()
+              })
+            )
+          );
+        }
+
+        if (deletedIds.length > 0) {
+          await sb.from('catalog_items').delete().in('id', deletedIds);
+        }
+
+        prevCatalogIds.current = currentIds;
+      } catch (e) {
+        console.error("[LalaJet] Catalog sync error:", e);
+      }
+    }, 650);
+
+    return () => {
+      if (catalogSaveTimer.current) window.clearTimeout(catalogSaveTimer.current);
+    };
+  }, [catalog, isAuthenticated, sb]);
+
+  // --------- REALTIME SUBSCRIPTIONS (multi-session live updates) ----------
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    if (!sb) return;
+    if (!initialLoadDone.current) return;
+
+    // One channel per table (simple)
+    const chClients = sb.channel('rt-clients');
+    const chQuotes = sb.channel('rt-quotes');
+    const chCatalog = sb.channel('rt-catalog');
+    const chSettings = sb.channel('rt-settings');
+
+    // Clients
+    chClients.on('postgres_changes', { event: '*', schema: 'public', table: 'clients' }, (payload: any) => {
+      const ev = payload.eventType;
+      if (ev === 'DELETE') {
+        const id = payload.old?.id;
+        if (!id) return;
+        setClients(prev => (Array.isArray(prev) ? prev : []).filter(c => c.id !== id));
+        prevClientIds.current = new Set([...prevClientIds.current].filter(x => x !== id));
+      } else {
+        const row = payload.new;
+        const data = row?.data as Client | undefined;
+        if (!data) return;
+        setClients(prev => {
+          const list = Array.isArray(prev) ? [...prev] : [];
+          const idx = list.findIndex(c => c.id === data.id);
+          if (idx >= 0) list[idx] = data;
+          else list.push(data);
+          return list;
+        });
+        prevClientIds.current = new Set((clients || []).map(c => c.id).concat([data.id]));
+      }
+    });
+
+    // Quotes
+    chQuotes.on('postgres_changes', { event: '*', schema: 'public', table: 'quotes' }, (payload: any) => {
+      const ev = payload.eventType;
+      if (ev === 'DELETE') {
+        const id = payload.old?.id;
+        if (!id) return;
+        setArchives(prev => (Array.isArray(prev) ? prev : []).filter(q => q.id !== id));
+      } else {
+        const row = payload.new;
+        const data = row?.data as Quote | undefined;
+        if (!data) return;
+        setArchives(prev => {
+          const list = Array.isArray(prev) ? [...prev] : [];
+          const idx = list.findIndex(q => q.id === data.id);
+          if (idx >= 0) list[idx] = data;
+          else list.push(data);
+          return list;
+        });
+      }
+    });
+
+    // Catalog
+    chCatalog.on('postgres_changes', { event: '*', schema: 'public', table: 'catalog_items' }, (payload: any) => {
+      const ev = payload.eventType;
+      if (ev === 'DELETE') {
+        const id = payload.old?.id;
+        if (!id) return;
+        setCatalog(prev => (Array.isArray(prev) ? prev : []).filter((c: any) => c.id !== id));
+        prevCatalogIds.current = new Set([...prevCatalogIds.current].filter(x => x !== id));
+      } else {
+        const row = payload.new;
+        const data = row?.data as QuoteCard | undefined;
+        if (!data) return;
+        const fixed = { ...(data as any), id: ensureId((data as any).id || row?.id) };
+        setCatalog(prev => {
+          const list = Array.isArray(prev) ? [...prev] : [];
+          const idx = list.findIndex((c: any) => c.id === fixed.id);
+          if (idx >= 0) list[idx] = fixed;
+          else list.push(fixed);
+          return list;
+        });
+      }
+    });
+
+    // Settings
+    chSettings.on('postgres_changes', { event: '*', schema: 'public', table: 'settings', filter: `id=eq.${SETTINGS_ROW_ID}` }, (payload: any) => {
+      const row = payload.new;
+      const data = row?.data as CompanyConfig | undefined;
+      if (data) setConfig(data);
+    });
+
+    const subAll = async () => {
+      await chClients.subscribe();
+      await chQuotes.subscribe();
+      await chCatalog.subscribe();
+      await chSettings.subscribe();
+    };
+
+    subAll().catch((e) => console.error("[LalaJet] Realtime subscribe error:", e));
+
+    return () => {
+      try { sb.removeChannel(chClients); } catch {}
+      try { sb.removeChannel(chQuotes); } catch {}
+      try { sb.removeChannel(chCatalog); } catch {}
+      try { sb.removeChannel(chSettings); } catch {}
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAuthenticated, sb]);
+
+  // --------- AUTH ----------
   const handleLogin = (e: React.FormEvent) => {
     e.preventDefault();
     if (passwordInput === APP_PASSWORD) {
@@ -472,6 +485,7 @@ const App: React.FC = () => {
     window.location.reload();
   };
 
+  // --------- QUOTE LOGIC ----------
   const resetActiveQuote = () => {
     if (confirm("Effacer tout le devis actuel pour en créer un nouveau ?")) {
       setActiveQuote(createEmptyQuote());
@@ -487,7 +501,6 @@ const App: React.FC = () => {
       (qEmail && c.email?.toLowerCase() === qEmail.toLowerCase()) ||
       (qName && c.name?.toLowerCase() === qName.toLowerCase())
     );
-
     if (existing) return existing;
 
     const newClient: Client = {
@@ -512,39 +525,43 @@ const App: React.FC = () => {
         const existingIdx = list.findIndex(a => a && a.id === activeQuote.id);
         if (existingIdx >= 0) {
           const newArchives = [...list];
-          newArchives[existingIdx] = JSON.parse(JSON.stringify(activeQuote));
+          newArchives[existingIdx] = safeJsonClone(activeQuote);
           return newArchives;
-        } else {
-          return [...list, { ...JSON.parse(JSON.stringify(activeQuote)), status: 'DRAFT' }];
         }
+        return [...list, { ...safeJsonClone(activeQuote), status: 'DRAFT' }];
       });
 
-      // sync immédiate (optionnel) -> mais l’auto-sync s’occupe déjà du reste
-      if (supabase) {
+      if (sb) {
         setDbStatus("Supabase: sync...");
-        await supabase.from('quotes').upsert({
+
+        const { error: quoteError } = await sb.from('quotes').upsert({
           id: activeQuote.id,
           data: activeQuote,
           updated_at: new Date().toISOString()
         });
 
         if (client) {
-          await supabase.from('clients').upsert({
+          await sb.from('clients').upsert({
             id: client.id,
             data: client,
             updated_at: new Date().toISOString()
           });
         }
 
-        setDbStatus("Supabase: OK ✅");
+        if (quoteError) {
+          console.error("[LalaJet] Quote upsert error:", quoteError.message);
+          setDbStatus(`Supabase: ERROR (${quoteError.message})`);
+        } else {
+          setDbStatus("Supabase: OK ✅");
+        }
       } else {
-        setDbStatus("Supabase: OFF");
+        setDbStatus("Supabase: OFF (env missing)");
       }
 
       setTimeout(() => setDbStatus(""), 2500);
       alert("Devis et données synchronisés.");
     } catch (err) {
-      console.error("Save error", err);
+      console.error("[LalaJet] Save error", err);
       alert("Erreur lors de la sauvegarde.");
     }
   };
@@ -552,9 +569,8 @@ const App: React.FC = () => {
   const deleteQuote = async (id: string) => {
     if (confirm('Supprimer ce devis définitivement ?')) {
       setArchives(prev => (Array.isArray(prev) ? prev : []).filter(a => a.id !== id));
-      // la suppression DB sera faite par l’auto-sync (et en plus on peut forcer ici)
-      if (supabase) {
-        await supabase.from('quotes').delete().eq('id', id);
+      if (sb) {
+        await sb.from('quotes').delete().eq('id', id);
       }
     }
   };
@@ -565,7 +581,7 @@ const App: React.FC = () => {
     ));
   };
 
-  // -------------------- UI --------------------
+  // --------- UI ----------
   if (!isAuthenticated) {
     return (
       <div className="min-h-screen bg-[#0f172a] flex items-center justify-center p-6">
@@ -646,10 +662,16 @@ const App: React.FC = () => {
 
           {view === 'EDITOR' && (
             <>
-              <button onClick={resetActiveQuote} className="text-[#E73188] border border-[#E73188] text-[10px] font-black uppercase tracking-widest px-6 py-2 hover:bg-[#E73188] hover:text-white rounded-full transition-all">
+              <button
+                onClick={resetActiveQuote}
+                className="text-[#E73188] border border-[#E73188] text-[10px] font-black uppercase tracking-widest px-6 py-2 hover:bg-[#E73188] hover:text-white rounded-full transition-all"
+              >
                 Nouveau Devis
               </button>
-              <button onClick={saveToArchive} className="text-slate-400 text-[10px] font-black uppercase tracking-widest px-6 py-2 hover:bg-slate-50 rounded-full transition">
+              <button
+                onClick={saveToArchive}
+                className="text-slate-400 text-[10px] font-black uppercase tracking-widest px-6 py-2 hover:bg-slate-50 rounded-full transition"
+              >
                 Sauvegarder Brouillon
               </button>
               <button
@@ -657,7 +679,9 @@ const App: React.FC = () => {
                 className="bg-[#E73188] text-white px-8 py-2.5 rounded-full text-[10px] font-black uppercase tracking-widest shadow-xl shadow-[#E73188]/20 hover:scale-105 active:scale-95 transition-all flex items-center gap-2"
               >
                 Aperçu PDF
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M14 5l7 7m0 0l-7 7m7-7H3"/></svg>
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M14 5l7 7m0 0l-7 7m7-7H3" />
+                </svg>
               </button>
             </>
           )}
@@ -692,6 +716,7 @@ const App: React.FC = () => {
             createNewQuote={resetActiveQuote}
           />
         )}
+
         {view === 'PREVIEW' && (
           <QuotePreview
             quote={activeQuote}
@@ -699,6 +724,7 @@ const App: React.FC = () => {
             config={config}
           />
         )}
+
         {view === 'ARCHIVE' && (
           <ArchiveView
             archives={archives}
@@ -708,6 +734,7 @@ const App: React.FC = () => {
             toggleStatus={toggleStatus}
           />
         )}
+
         {view === 'CATALOG' && (
           <CatalogManager
             config={config}
@@ -716,6 +743,7 @@ const App: React.FC = () => {
             setCatalog={setCatalog}
           />
         )}
+
         {view === 'CLIENTS' && (
           <ClientManager
             clients={clients}
@@ -731,20 +759,27 @@ const App: React.FC = () => {
             className={`w-10 h-10 rounded-full bg-white shadow-xl border-2 flex items-center justify-center text-[10px] font-black hover:scale-110 transition ${
               activeQuote.currency === Currency.EUR ? 'border-[#d4af37]' : 'border-slate-100'
             }`}
-          >€</button>
+          >
+            €
+          </button>
           <button
             onClick={() => setActiveQuote(p => ({ ...p, currency: Currency.USD }))}
             className={`w-10 h-10 rounded-full bg-white shadow-xl border-2 flex items-center justify-center text-[10px] font-black hover:scale-110 transition ${
               activeQuote.currency === Currency.USD ? 'border-[#d4af37]' : 'border-slate-100'
             }`}
-          >$</button>
+          >
+            $
+          </button>
           <button
             onClick={() => setActiveQuote(p => ({ ...p, currency: Currency.AED }))}
             className={`w-10 h-10 rounded-full bg-white shadow-xl border-2 flex items-center justify-center text-[8px] font-black hover:scale-110 transition ${
               activeQuote.currency === Currency.AED ? 'border-[#d4af37]' : 'border-slate-100'
             }`}
-          >AED</button>
+          >
+            AED
+          </button>
         </div>
+
         <div className="flex gap-2">
           {LANGUAGES.map(l => (
             <button
