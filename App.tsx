@@ -13,15 +13,7 @@ const APP_PASSWORD = "LALAJET2026";
 const LALAJET_LOGO_BASE64 =
   "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA1MDAgNTAwIj4KICA8ZyBmaWxsPSIjRTczMTg4Ij4KICAgIDxwYXRoIGQ9Ik0xMjAgODBoMzh2MTYwaC0zOHpNMjAwIDgwaDM4djE2MGgtMzh6TTEyMCAyNjBoMzh2MTYwaC0zOHpNMjAwIDgwaDM4djE2MGgtMzh6TTEyMCAyNjBoMzh2MTYwaC0zOHpNMjAwIDI2MGgzOHYxNjBoLTM4eiIgLz4KICAgIDx0ZXh0IHg9IjEyMCIgeT0iNDkwIiBmb250LWZhbWlseT0iUGxheWZhaXIgRGlzcGxheSIgZm9udC13ZWlnaHQ9ImJvbGQiIGZvbnQtc3R5bGU9Iml0YWxpYyIgZm9udC1zaXplPSI5MCIgZmlsbD0iI0U3MzE4OCI+amV0PC90ZXh0PgogIDwvZz4KICA8ZyBmaWxsPSIjZDRhZjM3Ij4KICAgIDxwYXRoIGQ9Ik0zNTAgODBjLTQwIDAtNzAgMzAtNzAgNzBzMzAgNzAgNzAgNzAgNzAtMzAgNzAtNzAtMzAtNzAtNzAtNzB6bTAgMTAwYy0xNyAwLTMwLTEzLTMwLTMwczEzLTMwIDMwLTMwIDMwIDEzIDMwIDEzIDMwIDEzIDMwLTMwIDMwek00MjAgMTYwczYwIDAgNjAgNjAtNjAgNjAtNjAgNjB6IiAvPgogIDwvZz4KPC9zdmc+";
 
-/**
- * On autorise des champs "en plus" dans config (ex: googleApiKey)
- * pour ne rien casser même si types.ts ne le contient pas.
- */
-type AppConfig = CompanyConfig & {
-  googleApiKey?: string; // optionnel
-};
-
-const DEFAULT_CONFIG: AppConfig = {
+const DEFAULT_CONFIG: CompanyConfig = {
   name: "LalaJet",
   logo: LALAJET_LOGO_BASE64,
   address: "Dubai Airport Freezone, Building 6EB, Office 250, Dubai, UAE",
@@ -31,8 +23,7 @@ const DEFAULT_CONFIG: AppConfig = {
   legalDisclaimer: "LalaJet is a flight broker. All flights are operated by certified air carriers.",
   footerInfo: "Offer valid for 48 hours. Subject to availability and traffic rights.",
   primaryColor: "#d4af37",
-  agents: [],
-  googleApiKey: "" // si tu veux, tu peux la remplir dans Config plus tard
+  agents: []
 };
 
 const createEmptyQuote = (): Quote => ({
@@ -83,6 +74,8 @@ const createEmptyQuote = (): Quote => ({
   agentPhone: '',
 });
 
+const SETTINGS_ROW_ID = "main";
+
 const App: React.FC = () => {
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
   const [passwordInput, setPasswordInput] = useState<string>("");
@@ -94,13 +87,12 @@ const App: React.FC = () => {
   const [archives, setArchives] = useState<Quote[]>([]);
   const [catalog, setCatalog] = useState<QuoteCard[]>([]);
   const [clients, setClients] = useState<Client[]>([]);
-  const [config, setConfig] = useState<AppConfig>(DEFAULT_CONFIG);
+  const [config, setConfig] = useState<CompanyConfig>(DEFAULT_CONFIG);
 
-  // anti spam supabase (petit délai)
-  const configSyncTimer = useRef<number | null>(null);
-  const catalogSyncTimer = useRef<number | null>(null);
+  const settingsSaveTimer = useRef<number | null>(null);
+  const initialLoadDone = useRef<boolean>(false);
 
-  // 1) Chargement initial localStorage + supabase
+  // --------- LOAD (localStorage + Supabase) ----------
   useEffect(() => {
     if (localStorage.getItem("lalajet_auth") === "1") {
       setIsAuthenticated(true);
@@ -111,63 +103,78 @@ const App: React.FC = () => {
     const savedClients = localStorage.getItem('lalajet_clients');
     const savedArchives = localStorage.getItem('lalajet_archives');
 
-    if (savedConfig) setConfig(JSON.parse(savedConfig));
-    if (savedCatalog) setCatalog(JSON.parse(savedCatalog));
-
+    if (savedConfig) {
+      try { setConfig(JSON.parse(savedConfig)); } catch {}
+    }
+    if (savedCatalog) {
+      try { setCatalog(JSON.parse(savedCatalog)); } catch {}
+    }
     if (savedClients) {
       try {
         const parsed = JSON.parse(savedClients);
         if (Array.isArray(parsed)) setClients(parsed);
-      } catch (e) { console.error("Error loading clients", e); }
+      } catch {}
     }
-
     if (savedArchives) {
       try {
         const parsed = JSON.parse(savedArchives);
         if (Array.isArray(parsed)) setArchives(parsed);
-      } catch (e) { console.error("Error loading archives", e); }
+      } catch {}
     }
 
-    // Si Supabase est présent, on charge la vérité depuis Supabase
+    // Supabase initial sync
     if (supabase) {
-      fetchFromSupabase();
+      fetchFromSupabase().finally(() => {
+        initialLoadDone.current = true;
+      });
+    } else {
+      initialLoadDone.current = true;
     }
   }, []);
 
-  // 2) Load depuis Supabase (quotes + clients + catalog + settings/config)
   const fetchFromSupabase = async () => {
     if (!supabase) return;
-    const sb = supabase; // <-- ça règle TS ("possibly null")
 
     try {
-      // A) Quotes
-      const { data: quotesData, error: qErr } = await sb.from('quotes').select('data');
-      if (!qErr && quotesData && quotesData.length > 0) {
+      // 0) SETTINGS (CONFIG)
+      const { data: settingsData, error: settingsError } = await supabase
+        .from('settings')
+        .select('data')
+        .eq('id', SETTINGS_ROW_ID)
+        .maybeSingle();
+
+      if (!settingsError && settingsData?.data) {
+        setConfig(settingsData.data as CompanyConfig);
+      }
+
+      // 1) QUOTES
+      const { data: quotesData } = await supabase.from('quotes').select('data');
+      if (quotesData && quotesData.length > 0) {
         const remoteQuotes = quotesData.map(q => q.data as Quote);
         setArchives(prev => {
-          const combined = Array.isArray(prev) ? [...prev] : [];
-          remoteQuotes.forEach(rq => {
+          const combined = [...prev];
+          remoteQuotes.forEach((rq) => {
             if (!combined.find(lq => lq.id === rq.id)) combined.push(rq);
           });
           return combined;
         });
       }
 
-      // B) Clients
-      const { data: clientsData, error: cErr } = await sb.from('clients').select('data');
-      if (!cErr && clientsData && clientsData.length > 0) {
+      // 2) CLIENTS
+      const { data: clientsData } = await supabase.from('clients').select('data');
+      if (clientsData && clientsData.length > 0) {
         const remoteClients = clientsData.map(c => c.data as Client);
         setClients(prev => {
-          const combined = Array.isArray(prev) ? [...prev] : [];
-          remoteClients.forEach(rc => {
+          const combined = [...prev];
+          remoteClients.forEach((rc) => {
             if (!combined.find(lc => lc.id === rc.id)) combined.push(rc);
           });
           return combined;
         });
       }
 
-      // C) Catalog items
-      const { data: catData, error: catError } = await sb.from('catalog_items').select('data');
+      // 3) CATALOG
+      const { data: catData, error: catError } = await supabase.from('catalog_items').select('data');
       if (catError) {
         console.error("[LalaJet] Catalog load error from Supabase:", catError.message);
       } else if (catData && catData.length > 0) {
@@ -175,25 +182,12 @@ const App: React.FC = () => {
         setCatalog(remoteCat);
       }
 
-      // D) SETTINGS / CONFIG (logo, couleurs, textes, googleApiKey, etc.)
-      const { data: settingsData, error: sErr } = await sb
-        .from('settings')
-        .select('data')
-        .eq('id', 'app')
-        .maybeSingle();
-
-      if (!sErr && settingsData && (settingsData as any).data) {
-        const remoteConfig = (settingsData as any).data as AppConfig;
-        if (remoteConfig && typeof remoteConfig === 'object') {
-          setConfig(prev => ({ ...prev, ...remoteConfig }));
-        }
-      }
     } catch (err) {
       console.error("Supabase load error:", err);
     }
   };
 
-  // 3) Sauvegarde locale automatique (localStorage)
+  // --------- LOCAL STORAGE AUTO SAVE ----------
   useEffect(() => {
     if (!isAuthenticated) return;
     try {
@@ -206,72 +200,46 @@ const App: React.FC = () => {
     }
   }, [config, catalog, clients, archives, isAuthenticated]);
 
-  // 4) Auto-sync CONFIG vers Supabase (logo/couleur/texte/clé google etc.)
+  // --------- SUPABASE AUTO SAVE FOR SETTINGS (CONFIG) ----------
   useEffect(() => {
     if (!isAuthenticated) return;
     if (!supabase) return;
+    if (!initialLoadDone.current) return;
 
-    // debounce (évite d'écrire 200 fois)
-    if (configSyncTimer.current) window.clearTimeout(configSyncTimer.current);
+    // debounce (évite d'envoyer 50 requêtes pendant que tu tapes)
+    if (settingsSaveTimer.current) {
+      window.clearTimeout(settingsSaveTimer.current);
+    }
 
-    configSyncTimer.current = window.setTimeout(async () => {
+    settingsSaveTimer.current = window.setTimeout(async () => {
       try {
-        const sb = supabase;
-        if (!sb) return;
-
-        await sb.from('settings').upsert({
-          id: 'app',
-          data: config,
-          updated_at: new Date().toISOString()
-        });
-
-        // (optionnel) petit statut
-        // setDbStatus("Config sauvegardée");
-        // setTimeout(() => setDbStatus(""), 1500);
-      } catch (e) {
-        console.error("Supabase config sync error:", e);
-      }
-    }, 800);
-
-    return () => {
-      if (configSyncTimer.current) window.clearTimeout(configSyncTimer.current);
-    };
-  }, [config, isAuthenticated]);
-
-  // 5) Auto-sync CATALOG vers Supabase (articles)
-  useEffect(() => {
-    if (!isAuthenticated) return;
-    if (!supabase) return;
-
-    if (catalogSyncTimer.current) window.clearTimeout(catalogSyncTimer.current);
-
-    catalogSyncTimer.current = window.setTimeout(async () => {
-      try {
-        const sb = supabase;
-        if (!sb) return;
-
-        if (!catalog || catalog.length === 0) return;
-
-        // upsert item par item
-        const promises = catalog.map(item => {
-          const itemId = (item as any).id || `card-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-          return sb.from('catalog_items').upsert({
-            id: itemId,
-            data: { ...(item as any), id: itemId },
+        setDbStatus("Config: sync...");
+        const { error } = await supabase
+          .from('settings')
+          .upsert({
+            id: SETTINGS_ROW_ID,
+            data: config,
             updated_at: new Date().toISOString()
           });
-        });
 
-        await Promise.all(promises);
+        if (error) {
+          console.error("[LalaJet] Settings upsert error:", error.message);
+          setDbStatus("Config: ERROR");
+        } else {
+          setDbStatus("Config: saved ✅");
+        }
+        setTimeout(() => setDbStatus(""), 2500);
       } catch (e) {
-        console.error("Supabase catalog sync error:", e);
+        console.error("[LalaJet] Settings save crash:", e);
+        setDbStatus("Config: ERROR");
+        setTimeout(() => setDbStatus(""), 2500);
       }
-    }, 800);
+    }, 700);
 
     return () => {
-      if (catalogSyncTimer.current) window.clearTimeout(catalogSyncTimer.current);
+      if (settingsSaveTimer.current) window.clearTimeout(settingsSaveTimer.current);
     };
-  }, [catalog, isAuthenticated]);
+  }, [config, isAuthenticated]);
 
   const handleLogin = (e: React.FormEvent) => {
     e.preventDefault();
@@ -321,11 +289,9 @@ const App: React.FC = () => {
   };
 
   const saveToArchive = async () => {
-    setDbStatus("SAVE...");
     try {
       const client = findOrCreateClientFromQuote(activeQuote);
 
-      // Local archives update
       setArchives(prev => {
         const list = Array.isArray(prev) ? prev : [];
         const existingIdx = list.findIndex(a => a && a.id === activeQuote.id);
@@ -333,50 +299,35 @@ const App: React.FC = () => {
           const newArchives = [...list];
           newArchives[existingIdx] = JSON.parse(JSON.stringify(activeQuote));
           return newArchives;
+        } else {
+          return [...list, { ...JSON.parse(JSON.stringify(activeQuote)), status: 'DRAFT' }];
         }
-        return [...list, { ...JSON.parse(JSON.stringify(activeQuote)), status: 'DRAFT' }];
       });
 
       // Supabase sync
       if (supabase) {
-        const sb = supabase;
-        if (!sb) {
-          setDbStatus("Supabase OFF");
-          return;
-        }
+        setDbStatus("Supabase: sync...");
 
-        setDbStatus("Supabase SYNC...");
-
-        // 1) Quote
-        const { error: quoteError } = await sb.from('quotes').upsert({
+        const { error: quoteError } = await supabase.from('quotes').upsert({
           id: activeQuote.id,
           data: activeQuote,
           updated_at: new Date().toISOString()
         });
 
-        // 2) Client
         if (client) {
-          await sb.from('clients').upsert({
+          await supabase.from('clients').upsert({
             id: client.id,
             data: client,
             updated_at: new Date().toISOString()
           });
         }
 
-        // 3) Config (settings)
-        await sb.from('settings').upsert({
-          id: 'app',
-          data: config,
-          updated_at: new Date().toISOString()
-        });
-
-        // 4) Catalog (articles)
         if (catalog && catalog.length > 0) {
           const catPromises = catalog.map(item => {
             const itemId = (item as any).id || `card-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-            return sb.from('catalog_items').upsert({
+            return supabase.from('catalog_items').upsert({
               id: itemId,
-              data: { ...(item as any), id: itemId },
+              data: item,
               updated_at: new Date().toISOString()
             });
           });
@@ -384,43 +335,37 @@ const App: React.FC = () => {
         }
 
         if (quoteError) {
-          setDbStatus(`Supabase ERROR: ${quoteError.message}`);
+          setDbStatus(`Supabase: ERROR (${quoteError.message})`);
         } else {
-          setDbStatus("Supabase OK ✅");
+          setDbStatus("Supabase: OK ✅");
         }
       } else {
-        setDbStatus("Supabase OFF");
+        setDbStatus("Supabase: OFF (env missing)");
       }
 
-      setTimeout(() => setDbStatus(""), 2000);
-      alert("Sauvegardé ✅");
+      setTimeout(() => setDbStatus(""), 2500);
+      alert("Devis et données synchronisés.");
     } catch (err) {
       console.error("Save error", err);
-      setDbStatus("Erreur");
       alert("Erreur lors de la sauvegarde.");
     }
   };
 
   const deleteQuote = async (id: string) => {
-    if (!confirm('Supprimer ce devis définitivement ?')) return;
-
-    setArchives(prev => (Array.isArray(prev) ? prev : []).filter(a => a.id !== id));
-
-    if (supabase) {
-      const sb = supabase;
-      if (sb) await sb.from('quotes').delete().eq('id', id);
+    if (confirm('Supprimer ce devis définitivement ?')) {
+      setArchives(prev => (Array.isArray(prev) ? prev : []).filter(a => a.id !== id));
+      if (supabase) {
+        await supabase.from('quotes').delete().eq('id', id);
+      }
     }
   };
 
   const toggleStatus = (id: string) => {
-    setArchives(prev =>
-      (Array.isArray(prev) ? prev : []).map(a =>
-        a.id === id ? { ...a, status: a.status === 'ACCEPTED' ? 'DRAFT' : 'ACCEPTED' } : a
-      )
-    );
+    setArchives(prev => (Array.isArray(prev) ? prev : []).map(a =>
+      a.id === id ? { ...a, status: a.status === 'ACCEPTED' ? 'DRAFT' : 'ACCEPTED' } : a
+    ));
   };
 
-  // LOGIN SCREEN
   if (!isAuthenticated) {
     return (
       <div className="min-h-screen bg-[#0f172a] flex items-center justify-center p-6">
@@ -457,7 +402,6 @@ const App: React.FC = () => {
     );
   }
 
-  // APP SCREEN
   return (
     <div className="min-h-screen bg-slate-50 font-sans text-slate-900 selection:bg-[#E73188]/10">
       <nav className="h-20 bg-white border-b border-slate-100 flex items-center justify-between px-10 sticky top-0 z-[60] shadow-sm no-print">
@@ -494,33 +438,26 @@ const App: React.FC = () => {
         </div>
 
         <div className="flex items-center gap-4">
+          {dbStatus && (
+            <span className="text-[8px] font-black uppercase tracking-widest text-[#E73188] animate-pulse bg-[#E73188]/5 px-3 py-1 rounded-full">
+              {dbStatus}
+            </span>
+          )}
+
           {view === 'EDITOR' && (
             <>
-              {dbStatus && (
-                <span className="text-[8px] font-black uppercase tracking-widest text-[#E73188] animate-pulse bg-[#E73188]/5 px-3 py-1 rounded-full">
-                  {dbStatus}
-                </span>
-              )}
-              <button
-                onClick={resetActiveQuote}
-                className="text-[#E73188] border border-[#E73188] text-[10px] font-black uppercase tracking-widest px-6 py-2 hover:bg-[#E73188] hover:text-white rounded-full transition-all"
-              >
+              <button onClick={resetActiveQuote} className="text-[#E73188] border border-[#E73188] text-[10px] font-black uppercase tracking-widest px-6 py-2 hover:bg-[#E73188] hover:text-white rounded-full transition-all">
                 Nouveau Devis
               </button>
-              <button
-                onClick={saveToArchive}
-                className="text-slate-400 text-[10px] font-black uppercase tracking-widest px-6 py-2 hover:bg-slate-50 rounded-full transition"
-              >
-                Sauvegarder
+              <button onClick={saveToArchive} className="text-slate-400 text-[10px] font-black uppercase tracking-widest px-6 py-2 hover:bg-slate-50 rounded-full transition">
+                Sauvegarder Brouillon
               </button>
               <button
                 onClick={() => setView('PREVIEW')}
                 className="bg-[#E73188] text-white px-8 py-2.5 rounded-full text-[10px] font-black uppercase tracking-widest shadow-xl shadow-[#E73188]/20 hover:scale-105 active:scale-95 transition-all flex items-center gap-2"
               >
                 Aperçu PDF
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M14 5l7 7m0 0l-7 7m7-7H3" />
-                </svg>
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M14 5l7 7m0 0l-7 7m7-7H3"/></svg>
               </button>
             </>
           )}
@@ -555,7 +492,6 @@ const App: React.FC = () => {
             createNewQuote={resetActiveQuote}
           />
         )}
-
         {view === 'PREVIEW' && (
           <QuotePreview
             quote={activeQuote}
@@ -563,7 +499,6 @@ const App: React.FC = () => {
             config={config}
           />
         )}
-
         {view === 'ARCHIVE' && (
           <ArchiveView
             archives={archives}
@@ -573,16 +508,14 @@ const App: React.FC = () => {
             toggleStatus={toggleStatus}
           />
         )}
-
         {view === 'CATALOG' && (
           <CatalogManager
             config={config}
-            setConfig={setConfig as any}
+            setConfig={setConfig}
             catalog={catalog}
             setCatalog={setCatalog}
           />
         )}
-
         {view === 'CLIENTS' && (
           <ClientManager
             clients={clients}
@@ -598,27 +531,20 @@ const App: React.FC = () => {
             className={`w-10 h-10 rounded-full bg-white shadow-xl border-2 flex items-center justify-center text-[10px] font-black hover:scale-110 transition ${
               activeQuote.currency === Currency.EUR ? 'border-[#d4af37]' : 'border-slate-100'
             }`}
-          >
-            €
-          </button>
+          >€</button>
           <button
             onClick={() => setActiveQuote(p => ({ ...p, currency: Currency.USD }))}
             className={`w-10 h-10 rounded-full bg-white shadow-xl border-2 flex items-center justify-center text-[10px] font-black hover:scale-110 transition ${
               activeQuote.currency === Currency.USD ? 'border-[#d4af37]' : 'border-slate-100'
             }`}
-          >
-            $
-          </button>
+          >$</button>
           <button
             onClick={() => setActiveQuote(p => ({ ...p, currency: Currency.AED }))}
             className={`w-10 h-10 rounded-full bg-white shadow-xl border-2 flex items-center justify-center text-[8px] font-black hover:scale-110 transition ${
               activeQuote.currency === Currency.AED ? 'border-[#d4af37]' : 'border-slate-100'
             }`}
-          >
-            AED
-          </button>
+          >AED</button>
         </div>
-
         <div className="flex gap-2">
           {LANGUAGES.map(l => (
             <button
