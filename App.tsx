@@ -77,6 +77,9 @@ const createEmptyQuote = (): Quote => ({
 const SETTINGS_ROW_ID = "main";
 
 const App: React.FC = () => {
+  // ✅ Alias qui évite TS18047 (supabase possibly null) partout
+  const sb = supabase;
+
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
   const [passwordInput, setPasswordInput] = useState<string>("");
   const [loginError, setLoginError] = useState<string>("");
@@ -123,21 +126,22 @@ const App: React.FC = () => {
     }
 
     // Supabase initial sync
-    if (supabase) {
+    if (sb) {
       fetchFromSupabase().finally(() => {
         initialLoadDone.current = true;
       });
     } else {
       initialLoadDone.current = true;
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const fetchFromSupabase = async () => {
-    if (!supabase) return;
+    if (!sb) return;
 
     try {
       // 0) SETTINGS (CONFIG)
-      const { data: settingsData, error: settingsError } = await supabase
+      const { data: settingsData, error: settingsError } = await sb
         .from('settings')
         .select('data')
         .eq('id', SETTINGS_ROW_ID)
@@ -148,7 +152,7 @@ const App: React.FC = () => {
       }
 
       // 1) QUOTES
-      const { data: quotesData } = await supabase.from('quotes').select('data');
+      const { data: quotesData } = await sb.from('quotes').select('data');
       if (quotesData && quotesData.length > 0) {
         const remoteQuotes = quotesData.map(q => q.data as Quote);
         setArchives(prev => {
@@ -161,7 +165,7 @@ const App: React.FC = () => {
       }
 
       // 2) CLIENTS
-      const { data: clientsData } = await supabase.from('clients').select('data');
+      const { data: clientsData } = await sb.from('clients').select('data');
       if (clientsData && clientsData.length > 0) {
         const remoteClients = clientsData.map(c => c.data as Client);
         setClients(prev => {
@@ -174,7 +178,7 @@ const App: React.FC = () => {
       }
 
       // 3) CATALOG
-      const { data: catData, error: catError } = await supabase.from('catalog_items').select('data');
+      const { data: catData, error: catError } = await sb.from('catalog_items').select('data');
       if (catError) {
         console.error("[LalaJet] Catalog load error from Supabase:", catError.message);
       } else if (catData && catData.length > 0) {
@@ -203,10 +207,10 @@ const App: React.FC = () => {
   // --------- SUPABASE AUTO SAVE FOR SETTINGS (CONFIG) ----------
   useEffect(() => {
     if (!isAuthenticated) return;
-    if (!supabase) return;
+    if (!sb) return;
     if (!initialLoadDone.current) return;
 
-    // debounce (évite d'envoyer 50 requêtes pendant que tu tapes)
+    // debounce
     if (settingsSaveTimer.current) {
       window.clearTimeout(settingsSaveTimer.current);
     }
@@ -214,7 +218,7 @@ const App: React.FC = () => {
     settingsSaveTimer.current = window.setTimeout(async () => {
       try {
         setDbStatus("Config: sync...");
-        const { error } = await supabase
+        const { error } = await sb
           .from('settings')
           .upsert({
             id: SETTINGS_ROW_ID,
@@ -239,7 +243,7 @@ const App: React.FC = () => {
     return () => {
       if (settingsSaveTimer.current) window.clearTimeout(settingsSaveTimer.current);
     };
-  }, [config, isAuthenticated]);
+  }, [config, isAuthenticated, sb]);
 
   const handleLogin = (e: React.FormEvent) => {
     e.preventDefault();
@@ -305,17 +309,17 @@ const App: React.FC = () => {
       });
 
       // Supabase sync
-      if (supabase) {
+      if (sb) {
         setDbStatus("Supabase: sync...");
 
-        const { error: quoteError } = await supabase.from('quotes').upsert({
+        const { error: quoteError } = await sb.from('quotes').upsert({
           id: activeQuote.id,
           data: activeQuote,
           updated_at: new Date().toISOString()
         });
 
         if (client) {
-          await supabase.from('clients').upsert({
+          await sb.from('clients').upsert({
             id: client.id,
             data: client,
             updated_at: new Date().toISOString()
@@ -325,7 +329,7 @@ const App: React.FC = () => {
         if (catalog && catalog.length > 0) {
           const catPromises = catalog.map(item => {
             const itemId = (item as any).id || `card-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-            return supabase.from('catalog_items').upsert({
+            return sb.from('catalog_items').upsert({
               id: itemId,
               data: item,
               updated_at: new Date().toISOString()
@@ -354,8 +358,8 @@ const App: React.FC = () => {
   const deleteQuote = async (id: string) => {
     if (confirm('Supprimer ce devis définitivement ?')) {
       setArchives(prev => (Array.isArray(prev) ? prev : []).filter(a => a.id !== id));
-      if (supabase) {
-        await supabase.from('quotes').delete().eq('id', id);
+      if (sb) {
+        await sb.from('quotes').delete().eq('id', id);
       }
     }
   };
