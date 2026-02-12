@@ -1,3 +1,4 @@
+console.log("SUPABASE OBJECT:", supabase);
 import React, { useState, useEffect, useRef } from 'react';
 import { QuoteEditor } from './components/QuoteEditor';
 import { CatalogManager } from './components/CatalogManager';
