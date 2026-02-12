@@ -93,6 +93,11 @@ const App: React.FC = () => {
   const initialLoadDone = useRef<boolean>(false);
   const realtimeDebounceTimer = useRef<number | null>(null);
 
+  // 🔥 NEW: keep previous clients to detect delete / update
+  const prevClientsMapRef = useRef<Map<string, string>>(new Map());
+  const clientsSyncTimerRef = useRef<number | null>(null);
+  const clientsSyncIsPrimedRef = useRef<boolean>(false);
+
   const refreshAllFromSupabase = async () => {
     await fetchFromSupabase();
   };
@@ -108,18 +113,16 @@ const App: React.FC = () => {
     const savedClients = localStorage.getItem('lalajet_clients');
     const savedArchives = localStorage.getItem('lalajet_archives');
 
-    if (savedConfig) {
-      try { setConfig(JSON.parse(savedConfig)); } catch {}
-    }
-    if (savedCatalog) {
-      try { setCatalog(JSON.parse(savedCatalog)); } catch {}
-    }
+    if (savedConfig) { try { setConfig(JSON.parse(savedConfig)); } catch {} }
+    if (savedCatalog) { try { setCatalog(JSON.parse(savedCatalog)); } catch {} }
+
     if (savedClients) {
       try {
         const parsed = JSON.parse(savedClients);
         if (Array.isArray(parsed)) setClients(parsed);
       } catch {}
     }
+
     if (savedArchives) {
       try {
         const parsed = JSON.parse(savedArchives);
@@ -143,7 +146,7 @@ const App: React.FC = () => {
     if (!sb) return;
 
     try {
-      // 0) SETTINGS (CONFIG)
+      // SETTINGS
       const { data: settingsData, error: settingsError } = await sb
         .from('settings')
         .select('data')
@@ -154,23 +157,21 @@ const App: React.FC = () => {
         setConfig(settingsData.data as CompanyConfig);
       }
 
-      // 1) QUOTES
+      // QUOTES
       const { data: quotesData } = await sb.from('quotes').select('data');
-      const remoteQuotes = (quotesData ?? []).map((q: any) => q.data as Quote);
-      setArchives(remoteQuotes);
+      setArchives((quotesData ?? []).map((q: any) => q.data as Quote));
 
-      // 2) CLIENTS
+      // CLIENTS
       const { data: clientsData } = await sb.from('clients').select('data');
       const remoteClients = (clientsData ?? []).map((c: any) => c.data as Client);
       setClients(remoteClients);
 
-      // 3) CATALOG
+      // CATALOG
       const { data: catData, error: catError } = await sb.from('catalog_items').select('data');
       if (catError) {
         console.error("[LalaJet] Catalog load error:", catError.message);
       } else {
-        const remoteCat = (catData ?? []).map((c: any) => c.data as QuoteCard);
-        setCatalog(remoteCat);
+        setCatalog((catData ?? []).map((c: any) => c.data as QuoteCard));
       }
     } catch (err) {
       console.error("Supabase load error:", err);
@@ -197,9 +198,7 @@ const App: React.FC = () => {
     if (!sb) return;
     if (!initialLoadDone.current) return;
 
-    if (settingsSaveTimer.current) {
-      window.clearTimeout(settingsSaveTimer.current);
-    }
+    if (settingsSaveTimer.current) window.clearTimeout(settingsSaveTimer.current);
 
     settingsSaveTimer.current = window.setTimeout(async () => {
       try {
@@ -231,6 +230,76 @@ const App: React.FC = () => {
     };
   }, [config, isAuthenticated]);
 
+  // ✅ NEW: SUPABASE SYNC FOR CLIENTS (fix delete/import across browsers)
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    const sb = supabase;
+    if (!sb) return;
+    if (!initialLoadDone.current) return;
+
+    // 1) prime only once (avoid accidental deletes on first render)
+    if (!clientsSyncIsPrimedRef.current) {
+      const prime = new Map<string, string>();
+      clients.forEach((c) => prime.set(c.id, JSON.stringify(c)));
+      prevClientsMapRef.current = prime;
+      clientsSyncIsPrimedRef.current = true;
+      return;
+    }
+
+    // 2) debounce sync
+    if (clientsSyncTimerRef.current) window.clearTimeout(clientsSyncTimerRef.current);
+
+    clientsSyncTimerRef.current = window.setTimeout(async () => {
+      try {
+        const prev = prevClientsMapRef.current;
+        const next = new Map<string, string>();
+        clients.forEach((c) => next.set(c.id, JSON.stringify(c)));
+
+        // deleted ids (in prev but not in next)
+        const deletedIds: string[] = [];
+        prev.forEach((_v, id) => {
+          if (!next.has(id)) deletedIds.push(id);
+        });
+
+        // new or changed clients
+        const upserts: Client[] = [];
+        next.forEach((json, id) => {
+          const prevJson = prev.get(id);
+          if (!prevJson || prevJson !== json) {
+            const obj = JSON.parse(json) as Client;
+            upserts.push(obj);
+          }
+        });
+
+        // apply DB operations
+        if (deletedIds.length > 0) {
+          await sb.from('clients').delete().in('id', deletedIds);
+        }
+
+        if (upserts.length > 0) {
+          await Promise.all(
+            upserts.map((client) =>
+              sb.from('clients').upsert({
+                id: client.id,
+                data: client,
+                updated_at: new Date().toISOString()
+              })
+            )
+          );
+        }
+
+        // update prev map after success
+        prevClientsMapRef.current = next;
+      } catch (e) {
+        console.error("[LalaJet] Clients sync error:", e);
+      }
+    }, 500);
+
+    return () => {
+      if (clientsSyncTimerRef.current) window.clearTimeout(clientsSyncTimerRef.current);
+    };
+  }, [clients, isAuthenticated]);
+
   // --------- REALTIME: sync deletions / imports / edits across browsers ----------
   useEffect(() => {
     if (!isAuthenticated) return;
@@ -238,10 +307,7 @@ const App: React.FC = () => {
     if (!sb) return;
 
     const scheduleRefresh = () => {
-      // petit debounce pour éviter 20 refresh si 20 lignes changent d’un coup
-      if (realtimeDebounceTimer.current) {
-        window.clearTimeout(realtimeDebounceTimer.current);
-      }
+      if (realtimeDebounceTimer.current) window.clearTimeout(realtimeDebounceTimer.current);
       realtimeDebounceTimer.current = window.setTimeout(() => {
         refreshAllFromSupabase();
       }, 400);
