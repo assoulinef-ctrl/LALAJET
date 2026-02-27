@@ -215,18 +215,16 @@ const App: React.FC = () => {
     }
   };
 
-  // --------- LOCAL STORAGE AUTO SAVE ----------
-  useEffect(() => {
-    if (!isAuthenticated) return;
-    try {
-      localStorage.setItem('lalajet_config', JSON.stringify(config));
-      localStorage.setItem('lalajet_catalog', JSON.stringify(catalog));
-      localStorage.setItem('lalajet_clients', JSON.stringify(clients));
-      localStorage.setItem('lalajet_archives', JSON.stringify(archives));
-    } catch (e) {
-      console.error("[LalaJet] LocalStorage error", e);
-    }
-  }, [config, catalog, clients, archives, isAuthenticated]);
+// ---------- LOCAL STORAGE AUTO SAVE ----------
+useEffect(() => {
+  if (!isAuthenticated) return;
+  try {
+    // On garde uniquement la config en local (optionnel)
+    localStorage.setItem('lalajet_config', JSON.stringify(config));
+  } catch (e) {
+    console.error("[LalaJet] LocalStorage error", e);
+  }
+}, [config, isAuthenticated]);
 
   // --------- SUPABASE AUTO SAVE FOR SETTINGS (CONFIG) ----------
   useEffect(() => {
