@@ -107,117 +107,96 @@ const App: React.FC = () => {
   const prevClientIds = useRef<Set<string>>(new Set());
   const prevCatalogIds = useRef<Set<string>>(new Set());
 
-  // ----------- LOAD (AUTH + CONFIG + DRAFT ONLY) -----------
-// ⚠️ Source of truth = Supabase.
-// On ne charge PLUS clients/catalog/archives depuis localStorage (sinon données “fantômes” entre navigateurs).
-useEffect(() => {
-  // auth (optionnel)
-  const authFlag = localStorage.getItem('lalajet_auth');
-  if (authFlag === 'true' || authFlag === '1') {
-    setIsAuthenticated(true);
-  }
+  // --------- LOAD (localStorage + Supabase) ----------
+  useEffect(() => {
+    if (localStorage.getItem("lalajet_auth") === "1") {
+      setIsAuthenticated(true);
+    }
 
-  // config locale (optionnel)
-  const savedConfig = localStorage.getItem('lalajet_config');
-  if (savedConfig) {
-    try { setConfig(JSON.parse(savedConfig)); } catch {}
-  }
+    // Local load (CONFIG ONLY)
+    const savedConfig = localStorage.getItem('lalajet_config');
+    if (savedConfig) {
+      try { setConfig(JSON.parse(savedConfig)); } catch {}
+    }
 
-  // brouillon local (optionnel)
-  const savedDraft = localStorage.getItem('lalajet_active_quote');
-  if (savedDraft) {
-    try { setActiveQuote(JSON.parse(savedDraft)); } catch {}
-  }
-}, []);
+    // ✅ CRITIQUE : on NE charge JAMAIS clients/catalog/archives depuis localStorage.
+    // Sinon un autre navigateur peut "ressusciter" une suppression.
+    try {
+      localStorage.removeItem('lalajet_catalog');
+      localStorage.removeItem('lalajet_clients');
+      localStorage.removeItem('lalajet_archives');
+    } catch {}
 
-    // ---------------- SUPABASE FETCH (SOURCE OF TRUTH) ----------------
+    // Supabase initial sync
+    if (sb) {
+      fetchFromSupabase().finally(() => {
+        initialLoadDone.current = true;
+      });
+    } else {
+      initialLoadDone.current = true;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const fetchFromSupabase = async () => {
     if (!sb) return;
 
     try {
-      setDbStatus("Sync...");
-
       // 0) SETTINGS (CONFIG)
-      const { data: settingsData, error: settingsErr } = await sb
+      const { data: settingsData } = await sb
         .from('settings')
         .select('data')
         .eq('id', SETTINGS_ROW_ID)
         .maybeSingle();
 
-      if (!settingsErr && settingsData?.data) {
+      if (settingsData?.data) {
         setConfig(settingsData.data as CompanyConfig);
       }
 
-      // 1) QUOTES (ARCHIVES) -> on remplace (pas de merge)
-      const { data: quoteRows, error: quotesErr } = await sb
+      // 1) QUOTES (ARCHIVES) => SOURCE OF TRUTH (ON REMPLACE 100%)
+      const { data: quotesRows } = await sb
         .from('quotes')
-        .select('id, data, updated_at')
+        .select('id,data,updated_at')
         .order('updated_at', { ascending: false });
 
-      if (!quotesErr) {
-        const remoteQuotes: Quote[] = (quoteRows || [])
-          .map((r: any) => ({ ...(r.data || {}), id: r.id }))
-          .filter((q: any) => q?.id);
+      const remoteQuotes: Quote[] = (quotesRows || [])
+        .map((r: any) => ({ ...(r.data || {}), id: r.id }))
+        .filter((q: any) => q?.id);
 
-        setArchives(remoteQuotes);
-      }
+      setArchives(remoteQuotes);
 
-      // 2) CLIENTS -> on remplace
-      const { data: clientsRows, error: clientsErr } = await sb
+      // 2) CLIENTS => SOURCE OF TRUTH (ON REMPLACE 100%)
+      const { data: clientsRows } = await sb
         .from('clients')
-        .select('id, data, updated_at')
+        .select('id,data,updated_at')
         .order('updated_at', { ascending: false });
 
-      if (!clientsErr) {
-        const remoteClients: Client[] = (clientsRows || [])
-          .map((r: any) => ({ ...(r.data || {}), id: r.id }))
-          .filter((c: any) => c?.id);
+      const remoteClients: Client[] = (clientsRows || [])
+        .map((r: any) => ({ ...(r.data || {}), id: r.id }))
+        .filter((c: any) => c?.id);
 
-        setClients(remoteClients);
+      setClients(remoteClients);
+      prevClientIds.current = new Set(remoteClients.map(c => c.id));
 
-        // baseline pour éviter de re-upsert juste après un fetch
-        prevClientIds.current = new Set(remoteClients.map(c => c.id));
-        prevClientHash.current = new Map(remoteClients.map(c => [c.id, JSON.stringify(c)]));
-      }
-
-      // 3) CATALOG -> on remplace
-      const { data: catalogRows, error: catalogErr } = await sb
+      // 3) CATALOG => SOURCE OF TRUTH (ON REMPLACE 100%)
+      const { data: catRows } = await sb
         .from('catalog_items')
-        .select('id, data, updated_at')
+        .select('id,data,updated_at')
         .order('updated_at', { ascending: false });
 
-      if (!catalogErr) {
-        const remoteCatalog: QuoteCard[] = (catalogRows || [])
-          .map((r: any) => ({ ...(r.data || {}), id: r.id }))
-          .filter((it: any) => it?.id);
+      const remoteCat: QuoteCard[] = (catRows || [])
+        .map((r: any) => ({ ...(r.data || {}), id: r.id }))
+        .filter((it: any) => it?.id);
 
-        setCatalog(remoteCatalog);
+      // ensure stable ids
+      const normalized = (remoteCat as any[]).map((it: any) => ({ ...it, id: ensureId(it.id) }));
+      setCatalog(normalized as any);
+      prevCatalogIds.current = new Set(normalized.map((i: any) => i.id));
 
-        prevCatalogIds.current = new Set(remoteCatalog.map((it: any) => it.id));
-        prevCatalogHash.current = new Map(remoteCatalog.map((it: any) => [it.id, JSON.stringify(it)]));
-      }
-
-      setDbStatus("OK");
-    } catch (e) {
-      console.error("[LalaJet] fetchFromSupabase error:", e);
-      setDbStatus("ERROR");
+    } catch (err) {
+      console.error("[LalaJet] Supabase load error:", err);
     }
   };
-
-  // ----------- INITIAL SUPABASE LOAD AFTER LOGIN -----------
-  useEffect(() => {
-    if (!isAuthenticated) return;
-    if (!sb) return;
-    if (initialLoadDone.current) return;
-
-    fetchFromSupabase()
-      .catch(() => {})
-      .finally(() => {
-        initialLoadDone.current = true;
-      });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isAuthenticated, sb]);
-
 
 // ---------- LOCAL STORAGE AUTO SAVE ----------
 useEffect(() => {
@@ -368,44 +347,106 @@ useEffect(() => {
 
   // --------- REALTIME SUBSCRIPTIONS (multi-session live updates) ----------
   useEffect(() => {
-  // ---------- SUPABASE REALTIME SUBS (instant cross-browser sync) ----------
-  useEffect(() => {
     if (!isAuthenticated) return;
     if (!sb) return;
+    if (!initialLoadDone.current) return;
 
-    let fetchTimer: number | null = null;
-    const scheduleFetch = () => {
-      if (fetchTimer) window.clearTimeout(fetchTimer);
-      fetchTimer = window.setTimeout(() => {
-        fetchFromSupabase().catch(() => {});
-      }, 300);
+    // One channel per table (simple)
+    const chClients = sb.channel('rt-clients');
+    const chQuotes = sb.channel('rt-quotes');
+    const chCatalog = sb.channel('rt-catalog');
+    const chSettings = sb.channel('rt-settings');
+
+    // Clients
+    chClients.on('postgres_changes', { event: '*', schema: 'public', table: 'clients' }, (payload: any) => {
+      const ev = payload.eventType;
+      if (ev === 'DELETE') {
+        const id = payload.old?.id;
+        if (!id) return;
+        setClients(prev => (Array.isArray(prev) ? prev : []).filter(c => c.id !== id));
+        prevClientIds.current = new Set([...prevClientIds.current].filter(x => x !== id));
+      } else {
+        const row = payload.new;
+        const data = row?.data as Client | undefined;
+        if (!data) return;
+        setClients(prev => {
+          const list = Array.isArray(prev) ? [...prev] : [];
+          const idx = list.findIndex(c => c.id === data.id);
+          if (idx >= 0) list[idx] = data;
+          else list.push(data);
+          return list;
+        });
+        prevClientIds.current = new Set((clients || []).map(c => c.id).concat([data.id]));
+      }
+    });
+
+    // Quotes
+    chQuotes.on('postgres_changes', { event: '*', schema: 'public', table: 'quotes' }, (payload: any) => {
+      const ev = payload.eventType;
+      if (ev === 'DELETE') {
+        const id = payload.old?.id;
+        if (!id) return;
+        setArchives(prev => (Array.isArray(prev) ? prev : []).filter(q => q.id !== id));
+      } else {
+        const row = payload.new;
+        const data = row?.data as Quote | undefined;
+        if (!data) return;
+        setArchives(prev => {
+          const list = Array.isArray(prev) ? [...prev] : [];
+          const idx = list.findIndex(q => q.id === data.id);
+          if (idx >= 0) list[idx] = data;
+          else list.push(data);
+          return list;
+        });
+      }
+    });
+
+    // Catalog
+    chCatalog.on('postgres_changes', { event: '*', schema: 'public', table: 'catalog_items' }, (payload: any) => {
+      const ev = payload.eventType;
+      if (ev === 'DELETE') {
+        const id = payload.old?.id;
+        if (!id) return;
+        setCatalog(prev => (Array.isArray(prev) ? prev : []).filter((c: any) => c.id !== id));
+        prevCatalogIds.current = new Set([...prevCatalogIds.current].filter(x => x !== id));
+      } else {
+        const row = payload.new;
+        const data = row?.data as QuoteCard | undefined;
+        if (!data) return;
+        const fixed = { ...(data as any), id: ensureId((data as any).id || row?.id) };
+        setCatalog(prev => {
+          const list = Array.isArray(prev) ? [...prev] : [];
+          const idx = list.findIndex((c: any) => c.id === fixed.id);
+          if (idx >= 0) list[idx] = fixed;
+          else list.push(fixed);
+          return list;
+        });
+      }
+    });
+
+    // Settings
+    chSettings.on('postgres_changes', { event: '*', schema: 'public', table: 'settings', filter: `id=eq.${SETTINGS_ROW_ID}` }, (payload: any) => {
+      const row = payload.new;
+      const data = row?.data as CompanyConfig | undefined;
+      if (data) setConfig(data);
+    });
+
+    const subAll = async () => {
+      await chClients.subscribe();
+      await chQuotes.subscribe();
+      await chCatalog.subscribe();
+      await chSettings.subscribe();
     };
 
-    // 1 canal unique, 4 tables
-    const channel = sb.channel('lalajet-sync');
-
-    channel
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'clients' }, scheduleFetch)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'catalog_items' }, scheduleFetch)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'quotes' }, scheduleFetch)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'settings' }, scheduleFetch)
-      .subscribe((status) => {
-        if (status === 'SUBSCRIBED') {
-          // petit refresh au moment où le realtime est prêt
-          scheduleFetch();
-        }
-      });
-
-    // Fallback: refresh toutes les 15s au cas où le realtime est bloqué
-    const interval = window.setInterval(() => {
-      fetchFromSupabase().catch(() => {});
-    }, 15000);
+    subAll().catch((e) => console.error("[LalaJet] Realtime subscribe error:", e));
 
     return () => {
-      if (fetchTimer) window.clearTimeout(fetchTimer);
-      window.clearInterval(interval);
-      sb.removeChannel(channel);
+      try { sb.removeChannel(chClients); } catch {}
+      try { sb.removeChannel(chQuotes); } catch {}
+      try { sb.removeChannel(chCatalog); } catch {}
+      try { sb.removeChannel(chSettings); } catch {}
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isAuthenticated, sb]);
 
   // --------- AUTH ----------
@@ -738,6 +779,5 @@ useEffect(() => {
     </div>
   );
 };
-
 
 export default App;
