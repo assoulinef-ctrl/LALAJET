@@ -1,16 +1,17 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { QuoteEditor } from './components/QuoteEditor';
 import { CatalogManager } from './components/CatalogManager';
 import { QuotePreview } from './components/QuotePreview';
 import { ArchiveView } from './components/ArchiveView';
 import { ClientManager } from './components/ClientManager';
 import { Quote, Language, Currency, CompanyConfig, QuoteCard, Client } from './types';
+import { LANGUAGES } from './constants';
 import { supabase } from './lib/supabase';
 
 // ✅ Mot de passe depuis Vercel Env (Project Settings → Environment Variables)
 // Ajoute VITE_APP_PASSWORD = tonMotDePasse
 // (fallback si absent)
-const APP_PASSWORD = import.meta.env.VITE_APP_PASSWORD || "LALAJET2026";
+const APP_PASSWORD = import.meta.env.VITE_APP_PASSWORD || 'LALAJET2026';
 
 const LALAJET_LOGO_BASE64 =
   "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHp2ZXJzZ..."; // (inchangé chez toi)
@@ -36,6 +37,7 @@ const ensureId = (id?: string) =>
 const safeJsonClone = <T,>(v: T): T => JSON.parse(JSON.stringify(v));
 
 const createEmptyQuote = (): Quote => ({
+  // ⚠️ garde la structure EXACTE de ton type Quote (ne change pas)
   id: "LJ-" + Date.now().toString().slice(-4) + "-" + Math.floor(Math.random() * 9000 + 1000),
   clientName: "",
   clientEmail: "",
@@ -43,6 +45,7 @@ const createEmptyQuote = (): Quote => ({
   language: Language.FR,
   currency: Currency.EUR,
   flightDetails: {
+    // ⚠️ garde tes clés existantes (ne renomme pas en departure/arrival si tes types attendent autre chose)
     date: new Date().toISOString().split('T')[0],
     departure: "",
     arrival: "",
@@ -66,6 +69,7 @@ const SETTINGS_ROW_ID = "config";
 const App: React.FC = () => {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [passwordInput, setPasswordInput] = useState("");
+  const [loginError, setLoginError] = useState("");
 
   const [activeTab, setActiveTab] = useState<'editor' | 'archives' | 'clients' | 'config'>('editor');
 
@@ -78,11 +82,20 @@ const App: React.FC = () => {
   const [dbStatus, setDbStatus] = useState<string>("");
 
   const sb = supabase;
+
   const initialLoadDone = useRef(false);
 
-  // =========================
-  // SUPABASE FETCH (TRUTH)
-  // =========================
+  const clientsSaveTimer = useRef<number | null>(null);
+  const catalogSaveTimer = useRef<number | null>(null);
+
+  const prevClientIds = useRef<Set<string>>(new Set());
+  const prevCatalogIds = useRef<Set<string>>(new Set());
+
+  // ✅ hashes pour upsert uniquement les changements
+  const prevClientHash = useRef<Map<string, string>>(new Map());
+  const prevCatalogHash = useRef<Map<string, string>>(new Map());
+
+  // ---------------- SUPABASE FETCH (SOURCE OF TRUTH) ----------------
   const fetchFromSupabase = async () => {
     if (!sb) return;
 
@@ -90,22 +103,21 @@ const App: React.FC = () => {
       setDbStatus("Sync...");
 
       // CONFIG
-      const { data: settingsData, error: settingsErr } = await sb
+      const { data: settingsData } = await sb
         .from('settings')
         .select('data')
         .eq('id', SETTINGS_ROW_ID)
         .maybeSingle();
 
-      if (settingsErr) console.warn("[LalaJet] settings fetch error:", settingsErr.message);
-      if (settingsData?.data) setConfig(settingsData.data as CompanyConfig);
+      if (settingsData?.data) {
+        setConfig(settingsData.data as CompanyConfig);
+      }
 
       // CLIENTS
-      const { data: clientsRows, error: clientsErr } = await sb
+      const { data: clientsRows } = await sb
         .from('clients')
-        .select('id, data')
+        .select('id, data, updated_at')
         .order('updated_at', { ascending: false });
-
-      if (clientsErr) console.warn("[LalaJet] clients fetch error:", clientsErr.message);
 
       const remoteClients: Client[] = (clientsRows || [])
         .map((r: any) => ({ ...(r.data || {}), id: r.id }))
@@ -113,13 +125,15 @@ const App: React.FC = () => {
 
       setClients(remoteClients);
 
-      // CATALOG
-      const { data: catalogRows, error: catalogErr } = await sb
-        .from('catalog_items')
-        .select('id, data')
-        .order('updated_at', { ascending: false });
+      // baseline (évite re-sync immédiat)
+      prevClientIds.current = new Set(remoteClients.map(c => c.id));
+      prevClientHash.current = new Map(remoteClients.map(c => [c.id, JSON.stringify(c)]));
 
-      if (catalogErr) console.warn("[LalaJet] catalog fetch error:", catalogErr.message);
+      // CATALOG
+      const { data: catalogRows } = await sb
+        .from('catalog_items')
+        .select('id, data, updated_at')
+        .order('updated_at', { ascending: false });
 
       const remoteCatalog: QuoteCard[] = (catalogRows || [])
         .map((r: any) => ({ ...(r.data || {}), id: r.id }))
@@ -127,13 +141,14 @@ const App: React.FC = () => {
 
       setCatalog(remoteCatalog);
 
-      // QUOTES (ARCHIVES) ✅ ON REMPLACE (pas de merge)
-      const { data: quoteRows, error: quotesErr } = await sb
-        .from('quotes')
-        .select('id, data')
-        .order('updated_at', { ascending: false });
+      prevCatalogIds.current = new Set(remoteCatalog.map((i: any) => i.id));
+      prevCatalogHash.current = new Map(remoteCatalog.map((i: any) => [i.id, JSON.stringify(i)]));
 
-      if (quotesErr) console.warn("[LalaJet] quotes fetch error:", quotesErr.message);
+      // QUOTES (ARCHIVES)
+      const { data: quoteRows } = await sb
+        .from('quotes')
+        .select('id, data, updated_at')
+        .order('updated_at', { ascending: false });
 
       const remoteQuotes: Quote[] = (quoteRows || [])
         .map((r: any) => ({ ...(r.data || {}), id: r.id }))
@@ -148,30 +163,61 @@ const App: React.FC = () => {
     }
   };
 
-  // =========================
-  // INITIAL LOAD
-  // =========================
+  // ---------------- REALTIME SYNC (multi-navigateurs) ----------------
+  // ✅ Dès qu'un autre navigateur ajoute/modifie/supprime, on refresh automatiquement
   useEffect(() => {
-    // OPTIONNEL : garder config en local (OK)
+    if (!isAuthenticated) return;
+    if (!sb) return;
+
+    const channel = sb
+      .channel('lalajet-realtime')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'clients' }, () => {
+        fetchFromSupabase().catch(() => {});
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'catalog_items' }, () => {
+        fetchFromSupabase().catch(() => {});
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'quotes' }, () => {
+        fetchFromSupabase().catch(() => {});
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'settings' }, () => {
+        fetchFromSupabase().catch(() => {});
+      })
+      .subscribe();
+
+    return () => {
+      sb.removeChannel(channel);
+    };
+  }, [isAuthenticated, sb]);
+
+  // ---------------- INITIAL LOAD ----------------
+  useEffect(() => {
+    // ✅ 1) Restore auth (optional)
+    const savedAuth = localStorage.getItem('lalajet_auth');
+    if (savedAuth === "1") setIsAuthenticated(true);
+
+    // ✅ 2) Keep ONLY config locally (optional)
     const savedConfig = localStorage.getItem('lalajet_config');
     if (savedConfig) {
       try { setConfig(JSON.parse(savedConfig)); } catch {}
     }
 
-    // On ne charge plus clients/catalog/archives en localStorage
-    if (sb) {
+    // ✅ 3) IMPORTANT: remove legacy local caches to avoid "ghost" data between browsers
+    localStorage.removeItem('lalajet_catalog');
+    localStorage.removeItem('lalajet_clients');
+    localStorage.removeItem('lalajet_archives');
+
+    // ✅ 4) Supabase = source of truth
+    if (sb && savedAuth === "1") {
       fetchFromSupabase().finally(() => {
         initialLoadDone.current = true;
       });
     } else {
       initialLoadDone.current = true;
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // =========================
-  // LOCAL STORAGE SAVE (CONFIG ONLY)
-  // =========================
+  // ---------------- LOCAL STORAGE SAVE (CONFIG ONLY) ----------------
   useEffect(() => {
     if (!isAuthenticated) return;
     try {
@@ -181,204 +227,221 @@ const App: React.FC = () => {
     }
   }, [config, isAuthenticated]);
 
-  // =========================
-  // CONFIG -> SUPABASE (À CHAQUE MODIF)
-  // =========================
-  const setConfigAndSync: React.Dispatch<React.SetStateAction<CompanyConfig>> = async (next) => {
-    if (!isAuthenticated || !sb || !initialLoadDone.current) {
-      setConfig(next as any);
-      return;
-    }
+  // ---------------- SUPABASE AUTO SAVE FOR SETTINGS (CONFIG) ----------------
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    if (!sb) return;
+    if (!initialLoadDone.current) return;
 
-    const newConfig = typeof next === 'function' ? (next as any)(config) : next;
-    setConfig(newConfig);
-
-    try {
-      setDbStatus("Config: saving...");
-      const { error } = await sb.from('settings').upsert({
-        id: SETTINGS_ROW_ID,
-        data: newConfig,
-        updated_at: new Date().toISOString()
-      });
-
-      if (error) throw error;
-
-      await fetchFromSupabase();
-      setDbStatus("Config: OK");
-    } catch (e: any) {
-      console.error("[LalaJet] Config save error:", e?.message || e);
-      setDbStatus("Config: ERROR");
-    }
-  };
-
-  // =========================
-  // CLIENTS -> SUPABASE (À CHAQUE ACTION)
-  // =========================
-  const setClientsAndSync: React.Dispatch<React.SetStateAction<Client[]>> = async (next) => {
-    if (!isAuthenticated || !sb || !initialLoadDone.current) {
-      setClients(next as any);
-      return;
-    }
-
-    const current = clients;
-    const nextClientsRaw = typeof next === 'function' ? (next as any)(current) : next;
-
-    // Normalise IDs
-    const nextClients = (nextClientsRaw || []).map((c: Client) => ({ ...c, id: ensureId(c.id) }));
-    setClients(nextClients);
-
-    try {
-      setDbStatus("Clients: saving...");
-
-      const currentIds = new Set(current.map(c => c.id));
-      const nextIds = new Set(nextClients.map(c => c.id));
-
-      const deletedIds = [...currentIds].filter(id => !nextIds.has(id));
-      const upserts = nextClients;
-
-      if (upserts.length > 0) {
-        // upsert un par un (simple, fiable)
-        for (const c of upserts) {
-          const { error } = await sb.from('clients').upsert({
-            id: c.id,
-            data: c,
+    const timer = window.setTimeout(async () => {
+      try {
+        setDbStatus("Config: sync...");
+        const { error } = await sb
+          .from('settings')
+          .upsert({
+            id: SETTINGS_ROW_ID,
+            data: config,
             updated_at: new Date().toISOString()
           });
-          if (error) throw error;
+
+        if (error) {
+          console.error("[LalaJet] Settings upsert error:", error.message);
+          setDbStatus("Config: ERROR");
+        } else {
+          setDbStatus("Config: OK");
         }
+      } catch (e) {
+        console.error("[LalaJet] Settings sync error:", e);
+        setDbStatus("Config: ERROR");
       }
+    }, 650);
 
-      if (deletedIds.length > 0) {
-        const { error } = await sb.from('clients').delete().in('id', deletedIds);
-        if (error) throw error;
-      }
+    return () => window.clearTimeout(timer);
+  }, [config, isAuthenticated, sb]);
 
-      await fetchFromSupabase();
-      setDbStatus("Clients: OK");
-    } catch (e: any) {
-      console.error("[LalaJet] Clients sync error:", e?.message || e);
-      setDbStatus("Clients: ERROR");
-    }
-  };
+  // --------- SUPABASE AUTO SYNC FOR CLIENTS (ADD/EDIT/DELETE) ----------
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    if (!sb) return;
+    if (!initialLoadDone.current) return;
 
-  // =========================
-  // CATALOG -> SUPABASE (À CHAQUE ACTION)
-  // =========================
-  const setCatalogAndSync: React.Dispatch<React.SetStateAction<QuoteCard[]>> = async (next) => {
-    if (!isAuthenticated || !sb || !initialLoadDone.current) {
-      setCatalog(next as any);
-      return;
-    }
+    if (clientsSaveTimer.current) window.clearTimeout(clientsSaveTimer.current);
 
-    const current = catalog;
-    const nextCatalogRaw = typeof next === 'function' ? (next as any)(current) : next;
+    clientsSaveTimer.current = window.setTimeout(async () => {
+      try {
+        const normalized = (clients || []).map(c => ({ ...c, id: ensureId(c.id) }));
 
-    const nextCatalog = (nextCatalogRaw || []).map((it: any) => ({ ...(it || {}), id: ensureId(it?.id) })) as QuoteCard[];
-    setCatalog(nextCatalog);
-
-    try {
-      setDbStatus("Catalog: saving...");
-
-      const currentIds = new Set((current || []).map((i: any) => i.id));
-      const nextIds = new Set((nextCatalog || []).map((i: any) => i.id));
-
-      const deletedIds = [...currentIds].filter(id => !nextIds.has(id));
-      const upserts = nextCatalog;
-
-      if (upserts.length > 0) {
-        for (const it of upserts as any[]) {
-          const { error } = await sb.from('catalog_items').upsert({
-            id: it.id,
-            data: it,
-            updated_at: new Date().toISOString()
-          });
-          if (error) throw error;
+        if (normalized.some((c, i) => c.id !== (clients[i]?.id))) {
+          setClients(normalized);
+          return;
         }
+
+        const currentIds = new Set(normalized.map(c => c.id));
+        const deletedIds = [...prevClientIds.current].filter(id => !currentIds.has(id));
+
+        // ✅ Upsert uniquement ce qui change
+        const toUpsert: Client[] = [];
+        for (const c of normalized) {
+          const h = JSON.stringify(c);
+          const prev = prevClientHash.current.get(c.id);
+          if (prev !== h) toUpsert.push(c);
+        }
+
+        if (toUpsert.length > 0) {
+          await Promise.all(
+            toUpsert.map(c =>
+              sb.from('clients').upsert({
+                id: c.id,
+                data: c,
+                updated_at: new Date().toISOString()
+              })
+            )
+          );
+        }
+
+        if (deletedIds.length > 0) {
+          const { error } = await sb.from('clients').delete().in('id', deletedIds);
+          if (error) console.error("[LalaJet] Clients delete error:", error.message);
+        }
+
+        prevClientIds.current = currentIds;
+        prevClientHash.current = new Map(normalized.map(c => [c.id, JSON.stringify(c)]));
+      } catch (e) {
+        console.error("[LalaJet] Clients sync error:", e);
       }
+    }, 650);
 
-      if (deletedIds.length > 0) {
-        const { error } = await sb.from('catalog_items').delete().in('id', deletedIds);
-        if (error) throw error;
+    return () => {
+      if (clientsSaveTimer.current) window.clearTimeout(clientsSaveTimer.current);
+    };
+  }, [clients, isAuthenticated, sb]);
+
+  // --------- SUPABASE AUTO SYNC FOR CATALOG (ADD/EDIT/DELETE) ----------
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    if (!sb) return;
+    if (!initialLoadDone.current) return;
+
+    if (catalogSaveTimer.current) window.clearTimeout(catalogSaveTimer.current);
+
+    catalogSaveTimer.current = window.setTimeout(async () => {
+      try {
+        const normalized = (catalog || []).map(it => ({ ...(it as any), id: ensureId((it as any).id) })) as any[];
+
+        if (normalized.some((it, i) => it.id !== (catalog[i] as any)?.id)) {
+          setCatalog(normalized as any);
+          return;
+        }
+
+        const currentIds = new Set(normalized.map(it => it.id));
+        const deletedIds = [...prevCatalogIds.current].filter(id => !currentIds.has(id));
+
+        const toUpsert: QuoteCard[] = [];
+        for (const it of normalized) {
+          const h = JSON.stringify(it);
+          const prev = prevCatalogHash.current.get(it.id);
+          if (prev !== h) toUpsert.push(it);
+        }
+
+        if (toUpsert.length > 0) {
+          await Promise.all(
+            toUpsert.map(it =>
+              sb.from('catalog_items').upsert({
+                id: (it as any).id,
+                data: it,
+                updated_at: new Date().toISOString()
+              })
+            )
+          );
+        }
+
+        if (deletedIds.length > 0) {
+          const { error } = await sb.from('catalog_items').delete().in('id', deletedIds);
+          if (error) console.error("[LalaJet] Catalog delete error:", error.message);
+        }
+
+        prevCatalogIds.current = currentIds;
+        prevCatalogHash.current = new Map(normalized.map(it => [it.id, JSON.stringify(it)]));
+      } catch (e) {
+        console.error("[LalaJet] Catalog sync error:", e);
       }
+    }, 650);
 
-      await fetchFromSupabase();
-      setDbStatus("Catalog: OK");
-    } catch (e: any) {
-      console.error("[LalaJet] Catalog sync error:", e?.message || e);
-      setDbStatus("Catalog: ERROR");
-    }
-  };
+    return () => {
+      if (catalogSaveTimer.current) window.clearTimeout(catalogSaveTimer.current);
+    };
+  }, [catalog, isAuthenticated, sb]);
 
-  // =========================
-  // AUTH
-  // =========================
-  const handleLogin = async () => {
+  // ---------------- AUTH ----------------
+  const handleLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
     if (passwordInput === APP_PASSWORD) {
+      // ✅ keep auth flag
+      localStorage.setItem("lalajet_auth", "1");
+
+      // ✅ remove legacy local caches (prevents "ghost" data)
+      localStorage.removeItem('lalajet_catalog');
+      localStorage.removeItem('lalajet_clients');
+      localStorage.removeItem('lalajet_archives');
+
       setIsAuthenticated(true);
+      setLoginError("");
       setPasswordInput("");
-      await fetchFromSupabase();
-      initialLoadDone.current = true;
+
+      // ✅ Supabase = source of truth
+      if (sb) {
+        await fetchFromSupabase();
+        initialLoadDone.current = true;
+      }
     } else {
-      alert("Mot de passe incorrect");
+      setLoginError("Mot de passe incorrect");
     }
   };
 
   const handleLogout = () => {
+    localStorage.removeItem("lalajet_auth");
     setIsAuthenticated(false);
   };
 
-  // =========================
-  // QUOTES (DEVIS) -> SUPABASE
-  // =========================
+  // ---------------- QUOTES ----------------
   const saveToArchive = async (quote: Quote) => {
     const q = safeJsonClone({ ...quote, updatedAt: new Date().toISOString() });
 
-    // UI immédiate
+    // local
     setArchives(prev => {
       const filtered = prev.filter(p => p.id !== q.id);
       return [q, ...filtered];
     });
 
-    try {
-      setDbStatus("Quotes: saving...");
-      if (sb) {
-        const { error } = await sb.from('quotes').upsert({
-          id: q.id,
-          data: q,
-          updated_at: new Date().toISOString()
-        });
-        if (error) throw error;
-      }
-      await fetchFromSupabase();
-      setDbStatus("Quotes: OK");
-    } catch (e: any) {
-      console.error("[LalaJet] Quote upsert error:", e?.message || e);
-      setDbStatus("Quotes: ERROR");
+    // remote
+    if (sb) {
+      const { error } = await sb.from('quotes').upsert({
+        id: q.id,
+        data: q,
+        updated_at: new Date().toISOString()
+      });
+      if (error) console.error("[LalaJet] Quotes upsert error:", error.message);
     }
   };
 
   const deleteQuote = async (quoteId: string) => {
-    // UI immédiate
+    // local
     setArchives(prev => prev.filter(q => q.id !== quoteId));
 
-    try {
-      setDbStatus("Quotes: deleting...");
-      if (sb) {
-        const { error } = await sb.from('quotes').delete().eq('id', quoteId);
-        if (error) throw error;
-      }
-      await fetchFromSupabase();
-      setDbStatus("Quotes: OK");
-    } catch (e: any) {
-      console.error("[LalaJet] Quote delete error:", e?.message || e);
-      setDbStatus("Quotes: ERROR");
+    // remote
+    if (sb) {
+      const { error } = await sb.from('quotes').delete().eq('id', quoteId);
+      if (error) console.error("[LalaJet] Quotes delete error:", error.message);
     }
+
+    // refresh
+    fetchFromSupabase().catch(() => {});
   };
 
   const toggleStatus = async (quoteId: string) => {
     const q = archives.find(a => a.id === quoteId);
     if (!q) return;
-    const updated = { ...q, status: q.status === 'draft' ? 'sent' : 'draft', updatedAt: new Date().toISOString() };
+    const updated = { ...q, status: (q as any).status === 'draft' ? 'sent' : 'draft', updatedAt: new Date().toISOString() } as Quote;
     await saveToArchive(updated);
   };
 
@@ -402,33 +465,25 @@ const App: React.FC = () => {
       address: "",
       country: "",
       type: "PRIVATE"
-    };
+    } as any;
 
-    try {
-      setDbStatus("Clients: saving...");
-      if (sb) {
-        const { error } = await sb.from('clients').upsert({
-          id: newClient.id,
-          data: newClient,
-          updated_at: new Date().toISOString()
-        });
-        if (error) throw error;
-      }
-      await fetchFromSupabase();
-      setDbStatus("Clients: OK");
-    } catch (e: any) {
-      console.error("[LalaJet] client create error:", e?.message || e);
-      setDbStatus("Clients: ERROR");
+    setClients(prev => [newClient, ...prev]);
+
+    if (sb) {
+      const { error } = await sb.from('clients').upsert({
+        id: newClient.id,
+        data: newClient,
+        updated_at: new Date().toISOString()
+      });
+      if (error) console.error("[LalaJet] Client upsert error:", error.message);
     }
   };
 
-  // =========================
-  // UI
-  // =========================
+  // ---------------- UI ----------------
   if (!isAuthenticated) {
     return (
       <div style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', background: '#0b0f1a' }}>
-        <div style={{ width: 360, padding: 24, borderRadius: 16, background: '#fff', textAlign: 'center' }}>
+        <form onSubmit={handleLogin} style={{ width: 360, padding: 24, borderRadius: 16, background: '#fff', textAlign: 'center' }}>
           <img src={LALAJET_LOGO_BASE64} alt="LalaJet" style={{ width: 80, marginBottom: 12 }} />
           <h2 style={{ margin: 0, marginBottom: 8 }}>ACCÈS RÉSERVÉ</h2>
           <p style={{ marginTop: 0, opacity: .7 }}>LalaJet internal system</p>
@@ -438,22 +493,30 @@ const App: React.FC = () => {
             value={passwordInput}
             placeholder="Mot de passe"
             onChange={(e) => setPasswordInput(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter') handleLogin(); }}
             style={{ width: '100%', padding: 12, borderRadius: 10, border: '1px solid #ddd', marginBottom: 12 }}
           />
+
+          {loginError && (
+            <div style={{ color: '#c00', fontSize: 12, marginBottom: 10 }}>
+              {loginError}
+            </div>
+          )}
+
           <button
-            onClick={handleLogin}
+            type="submit"
             style={{ width: '100%', padding: 12, borderRadius: 10, border: 0, background: '#ff2d86', color: '#fff', fontWeight: 700 }}
           >
             Se connecter
           </button>
-        </div>
+        </form>
       </div>
     );
   }
 
   return (
     <div>
+      {/* Top bar / nav */}
+      {/* ⚠️ Je garde ton UI existante : adapte si besoin */}
       <div style={{ padding: 12, display: 'flex', gap: 12, alignItems: 'center' }}>
         <button onClick={() => setActiveTab('editor')}>Éditeur</button>
         <button onClick={() => setActiveTab('archives')}>Archives</button>
@@ -486,7 +549,7 @@ const App: React.FC = () => {
       {activeTab === 'archives' && (
         <ArchiveView
           archives={archives}
-          onOpen={(q) => { setActiveQuote(q); setActiveTab('editor'); }}
+          onOpen={(q: any) => { setActiveQuote(q); setActiveTab('editor'); }}
           onDelete={deleteQuote}
           onToggleStatus={toggleStatus}
         />
@@ -495,16 +558,16 @@ const App: React.FC = () => {
       {activeTab === 'clients' && (
         <ClientManager
           clients={clients}
-          setClients={setClientsAndSync}
+          setClients={setClients}
         />
       )}
 
       {activeTab === 'config' && (
         <CatalogManager
           config={config}
-          setConfig={setConfigAndSync}
+          setConfig={setConfig}
           catalog={catalog}
-          setCatalog={setCatalogAndSync}
+          setCatalog={setCatalog}
         />
       )}
     </div>
