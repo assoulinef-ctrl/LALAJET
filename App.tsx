@@ -5,7 +5,6 @@ import { QuotePreview } from './components/QuotePreview';
 import { ArchiveView } from './components/ArchiveView';
 import { ClientManager } from './components/ClientManager';
 import { Quote, Language, Currency, CompanyConfig, QuoteCard, Client } from './types';
-import { LANGUAGES } from './constants';
 import { supabase } from './lib/supabase';
 
 // ✅ Mot de passe depuis Vercel Env (Project Settings → Environment Variables)
@@ -29,7 +28,11 @@ const DEFAULT_CONFIG: CompanyConfig = {
   agents: []
 };
 
-const ensureId = (id?: string) => id && id.trim() ? id : (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + String(Math.random()).slice(2));
+const ensureId = (id?: string) =>
+  id && id.trim()
+    ? id
+    : (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + String(Math.random()).slice(2));
+
 const safeJsonClone = <T,>(v: T): T => JSON.parse(JSON.stringify(v));
 
 const createEmptyQuote = (): Quote => ({
@@ -75,20 +78,11 @@ const App: React.FC = () => {
   const [dbStatus, setDbStatus] = useState<string>("");
 
   const sb = supabase;
-
   const initialLoadDone = useRef(false);
 
-  const clientsSaveTimer = useRef<number | null>(null);
-  const catalogSaveTimer = useRef<number | null>(null);
-
-  const prevClientIds = useRef<Set<string>>(new Set());
-  const prevCatalogIds = useRef<Set<string>>(new Set());
-
-  // ✅ hashes pour upsert uniquement les changements
-  const prevClientHash = useRef<Map<string, string>>(new Map());
-  const prevCatalogHash = useRef<Map<string, string>>(new Map());
-
-  // ---------------- SUPABASE FETCH (SOURCE OF TRUTH) ----------------
+  // =========================
+  // SUPABASE FETCH (TRUTH)
+  // =========================
   const fetchFromSupabase = async () => {
     if (!sb) return;
 
@@ -96,21 +90,22 @@ const App: React.FC = () => {
       setDbStatus("Sync...");
 
       // CONFIG
-      const { data: settingsData } = await sb
+      const { data: settingsData, error: settingsErr } = await sb
         .from('settings')
         .select('data')
         .eq('id', SETTINGS_ROW_ID)
         .maybeSingle();
 
-      if (settingsData?.data) {
-        setConfig(settingsData.data as CompanyConfig);
-      }
+      if (settingsErr) console.warn("[LalaJet] settings fetch error:", settingsErr.message);
+      if (settingsData?.data) setConfig(settingsData.data as CompanyConfig);
 
       // CLIENTS
-      const { data: clientsRows } = await sb
+      const { data: clientsRows, error: clientsErr } = await sb
         .from('clients')
         .select('id, data')
         .order('updated_at', { ascending: false });
+
+      if (clientsErr) console.warn("[LalaJet] clients fetch error:", clientsErr.message);
 
       const remoteClients: Client[] = (clientsRows || [])
         .map((r: any) => ({ ...(r.data || {}), id: r.id }))
@@ -118,15 +113,13 @@ const App: React.FC = () => {
 
       setClients(remoteClients);
 
-      // baseline (évite re-sync immédiat)
-      prevClientIds.current = new Set(remoteClients.map(c => c.id));
-      prevClientHash.current = new Map(remoteClients.map(c => [c.id, JSON.stringify(c)]));
-
       // CATALOG
-      const { data: catalogRows } = await sb
+      const { data: catalogRows, error: catalogErr } = await sb
         .from('catalog_items')
         .select('id, data')
         .order('updated_at', { ascending: false });
+
+      if (catalogErr) console.warn("[LalaJet] catalog fetch error:", catalogErr.message);
 
       const remoteCatalog: QuoteCard[] = (catalogRows || [])
         .map((r: any) => ({ ...(r.data || {}), id: r.id }))
@@ -134,14 +127,13 @@ const App: React.FC = () => {
 
       setCatalog(remoteCatalog);
 
-      prevCatalogIds.current = new Set(remoteCatalog.map((i: any) => i.id));
-      prevCatalogHash.current = new Map(remoteCatalog.map((i: any) => [i.id, JSON.stringify(i)]));
-
-      // QUOTES (ARCHIVES) ✅ IMPORTANT : ON REMPLACE (pas de merge)
-      const { data: quoteRows } = await sb
+      // QUOTES (ARCHIVES) ✅ ON REMPLACE (pas de merge)
+      const { data: quoteRows, error: quotesErr } = await sb
         .from('quotes')
         .select('id, data')
         .order('updated_at', { ascending: false });
+
+      if (quotesErr) console.warn("[LalaJet] quotes fetch error:", quotesErr.message);
 
       const remoteQuotes: Quote[] = (quoteRows || [])
         .map((r: any) => ({ ...(r.data || {}), id: r.id }))
@@ -156,18 +148,17 @@ const App: React.FC = () => {
     }
   };
 
-  // ---------------- INITIAL LOAD ----------------
+  // =========================
+  // INITIAL LOAD
+  // =========================
   useEffect(() => {
-    // ⚠️ ON NE CHARGE PLUS clients/catalog/archives depuis localStorage
-    // (c'était la cause principale des données "fantômes" dans un autre navigateur)
-
-    // (optionnel) config locale seulement
+    // OPTIONNEL : garder config en local (OK)
     const savedConfig = localStorage.getItem('lalajet_config');
     if (savedConfig) {
       try { setConfig(JSON.parse(savedConfig)); } catch {}
     }
 
-    // Supabase initial sync
+    // On ne charge plus clients/catalog/archives en localStorage
     if (sb) {
       fetchFromSupabase().finally(() => {
         initialLoadDone.current = true;
@@ -178,7 +169,9 @@ const App: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ---------------- LOCAL STORAGE SAVE (CONFIG ONLY) ----------------
+  // =========================
+  // LOCAL STORAGE SAVE (CONFIG ONLY)
+  // =========================
   useEffect(() => {
     if (!isAuthenticated) return;
     try {
@@ -188,163 +181,137 @@ const App: React.FC = () => {
     }
   }, [config, isAuthenticated]);
 
-  // ---------------- SUPABASE AUTO SAVE FOR SETTINGS (CONFIG) ----------------
-  useEffect(() => {
-    if (!isAuthenticated) return;
-    if (!sb) return;
-    if (!initialLoadDone.current) return;
+  // =========================
+  // CONFIG -> SUPABASE (À CHAQUE MODIF)
+  // =========================
+  const setConfigAndSync: React.Dispatch<React.SetStateAction<CompanyConfig>> = async (next) => {
+    if (!isAuthenticated || !sb || !initialLoadDone.current) {
+      setConfig(next as any);
+      return;
+    }
 
-    const timer = window.setTimeout(async () => {
-      try {
-        setDbStatus("Config: sync...");
-        const { error } = await sb
-          .from('settings')
-          .upsert({
-            id: SETTINGS_ROW_ID,
-            data: config,
+    const newConfig = typeof next === 'function' ? (next as any)(config) : next;
+    setConfig(newConfig);
+
+    try {
+      setDbStatus("Config: saving...");
+      const { error } = await sb.from('settings').upsert({
+        id: SETTINGS_ROW_ID,
+        data: newConfig,
+        updated_at: new Date().toISOString()
+      });
+
+      if (error) throw error;
+
+      await fetchFromSupabase();
+      setDbStatus("Config: OK");
+    } catch (e: any) {
+      console.error("[LalaJet] Config save error:", e?.message || e);
+      setDbStatus("Config: ERROR");
+    }
+  };
+
+  // =========================
+  // CLIENTS -> SUPABASE (À CHAQUE ACTION)
+  // =========================
+  const setClientsAndSync: React.Dispatch<React.SetStateAction<Client[]>> = async (next) => {
+    if (!isAuthenticated || !sb || !initialLoadDone.current) {
+      setClients(next as any);
+      return;
+    }
+
+    const current = clients;
+    const nextClientsRaw = typeof next === 'function' ? (next as any)(current) : next;
+
+    // Normalise IDs
+    const nextClients = (nextClientsRaw || []).map((c: Client) => ({ ...c, id: ensureId(c.id) }));
+    setClients(nextClients);
+
+    try {
+      setDbStatus("Clients: saving...");
+
+      const currentIds = new Set(current.map(c => c.id));
+      const nextIds = new Set(nextClients.map(c => c.id));
+
+      const deletedIds = [...currentIds].filter(id => !nextIds.has(id));
+      const upserts = nextClients;
+
+      if (upserts.length > 0) {
+        // upsert un par un (simple, fiable)
+        for (const c of upserts) {
+          const { error } = await sb.from('clients').upsert({
+            id: c.id,
+            data: c,
             updated_at: new Date().toISOString()
           });
-
-        if (error) {
-          console.error("[LalaJet] Settings upsert error:", error.message);
-          setDbStatus("Config: ERROR");
-        } else {
-          setDbStatus("Config: OK");
+          if (error) throw error;
         }
-      } catch (e) {
-        console.error("[LalaJet] Settings sync error:", e);
-        setDbStatus("Config: ERROR");
       }
-    }, 650);
 
-    return () => window.clearTimeout(timer);
-  }, [config, isAuthenticated, sb]);
-
-  // --------- SUPABASE AUTO SYNC FOR CLIENTS (ADD/EDIT/DELETE) ----------
-  useEffect(() => {
-    if (!isAuthenticated) return;
-    if (!sb) return;
-    if (!initialLoadDone.current) return;
-
-    if (clientsSaveTimer.current) window.clearTimeout(clientsSaveTimer.current);
-
-    clientsSaveTimer.current = window.setTimeout(async () => {
-      try {
-        const normalized = (clients || []).map(c => ({ ...c, id: ensureId(c.id) }));
-
-        if (normalized.some((c, i) => c.id !== (clients[i]?.id))) {
-          setClients(normalized);
-          return;
-        }
-
-        const currentIds = new Set(normalized.map(c => c.id));
-        const deletedIds = [...prevClientIds.current].filter(id => !currentIds.has(id));
-
-        // ✅ Upsert uniquement ce qui change
-        const toUpsert: Client[] = [];
-        for (const c of normalized) {
-          const h = JSON.stringify(c);
-          const prev = prevClientHash.current.get(c.id);
-          if (prev !== h) toUpsert.push(c);
-        }
-
-        if (toUpsert.length > 0) {
-          await Promise.all(
-            toUpsert.map(c =>
-              sb.from('clients').upsert({
-                id: c.id,
-                data: c,
-                updated_at: new Date().toISOString()
-              })
-            )
-          );
-        }
-
-        if (deletedIds.length > 0) {
-          await sb.from('clients').delete().in('id', deletedIds);
-        }
-
-        prevClientIds.current = currentIds;
-        prevClientHash.current = new Map(normalized.map(c => [c.id, JSON.stringify(c)]));
-      } catch (e) {
-        console.error("[LalaJet] Clients sync error:", e);
+      if (deletedIds.length > 0) {
+        const { error } = await sb.from('clients').delete().in('id', deletedIds);
+        if (error) throw error;
       }
-    }, 650);
 
-    return () => {
-      if (clientsSaveTimer.current) window.clearTimeout(clientsSaveTimer.current);
-    };
-  }, [clients, isAuthenticated, sb]);
+      await fetchFromSupabase();
+      setDbStatus("Clients: OK");
+    } catch (e: any) {
+      console.error("[LalaJet] Clients sync error:", e?.message || e);
+      setDbStatus("Clients: ERROR");
+    }
+  };
 
-  // --------- SUPABASE AUTO SYNC FOR CATALOG (ADD/EDIT/DELETE) ----------
-  useEffect(() => {
-    if (!isAuthenticated) return;
-    if (!sb) return;
-    if (!initialLoadDone.current) return;
+  // =========================
+  // CATALOG -> SUPABASE (À CHAQUE ACTION)
+  // =========================
+  const setCatalogAndSync: React.Dispatch<React.SetStateAction<QuoteCard[]>> = async (next) => {
+    if (!isAuthenticated || !sb || !initialLoadDone.current) {
+      setCatalog(next as any);
+      return;
+    }
 
-    if (catalogSaveTimer.current) window.clearTimeout(catalogSaveTimer.current);
+    const current = catalog;
+    const nextCatalogRaw = typeof next === 'function' ? (next as any)(current) : next;
 
-    catalogSaveTimer.current = window.setTimeout(async () => {
-      try {
-        const normalized = (catalog || []).map(it => ({ ...(it as any), id: ensureId((it as any).id) })) as any[];
+    const nextCatalog = (nextCatalogRaw || []).map((it: any) => ({ ...(it || {}), id: ensureId(it?.id) })) as QuoteCard[];
+    setCatalog(nextCatalog);
 
-        if (normalized.some((it, i) => it.id !== (catalog[i] as any)?.id)) {
-          setCatalog(normalized as any);
-          return;
+    try {
+      setDbStatus("Catalog: saving...");
+
+      const currentIds = new Set((current || []).map((i: any) => i.id));
+      const nextIds = new Set((nextCatalog || []).map((i: any) => i.id));
+
+      const deletedIds = [...currentIds].filter(id => !nextIds.has(id));
+      const upserts = nextCatalog;
+
+      if (upserts.length > 0) {
+        for (const it of upserts as any[]) {
+          const { error } = await sb.from('catalog_items').upsert({
+            id: it.id,
+            data: it,
+            updated_at: new Date().toISOString()
+          });
+          if (error) throw error;
         }
-
-        const currentIds = new Set(normalized.map(it => it.id));
-        const deletedIds = [...prevCatalogIds.current].filter(id => !currentIds.has(id));
-
-        const toUpsert: QuoteCard[] = [];
-        for (const it of normalized) {
-          const h = JSON.stringify(it);
-          const prev = prevCatalogHash.current.get(it.id);
-          if (prev !== h) toUpsert.push(it);
-        }
-
-        if (toUpsert.length > 0) {
-          await Promise.all(
-            toUpsert.map(it =>
-              sb.from('catalog_items').upsert({
-                id: (it as any).id,
-                data: it,
-                updated_at: new Date().toISOString()
-              })
-            )
-          );
-        }
-
-        if (deletedIds.length > 0) {
-          await sb.from('catalog_items').delete().in('id', deletedIds);
-        }
-
-        prevCatalogIds.current = currentIds;
-        prevCatalogHash.current = new Map(normalized.map(it => [it.id, JSON.stringify(it)]));
-      } catch (e) {
-        console.error("[LalaJet] Catalog sync error:", e);
       }
-    }, 650);
 
-    return () => {
-      if (catalogSaveTimer.current) window.clearTimeout(catalogSaveTimer.current);
-    };
-  }, [catalog, isAuthenticated, sb]);
+      if (deletedIds.length > 0) {
+        const { error } = await sb.from('catalog_items').delete().in('id', deletedIds);
+        if (error) throw error;
+      }
 
-  // --------- AUTO REFRESH (multi-navigateurs) ----------
-  // ✅ pour refléter les suppressions faites ailleurs sans recharger
-  useEffect(() => {
-    if (!isAuthenticated) return;
-    if (!sb) return;
+      await fetchFromSupabase();
+      setDbStatus("Catalog: OK");
+    } catch (e: any) {
+      console.error("[LalaJet] Catalog sync error:", e?.message || e);
+      setDbStatus("Catalog: ERROR");
+    }
+  };
 
-    const interval = window.setInterval(() => {
-      fetchFromSupabase().catch(() => {});
-    }, 15000);
-
-    return () => window.clearInterval(interval);
-  }, [isAuthenticated, sb]);
-
-  // ---------------- AUTH ----------------
+  // =========================
+  // AUTH
+  // =========================
   const handleLogin = async () => {
     if (passwordInput === APP_PASSWORD) {
       setIsAuthenticated(true);
@@ -360,37 +327,52 @@ const App: React.FC = () => {
     setIsAuthenticated(false);
   };
 
-  // ---------------- QUOTES ----------------
+  // =========================
+  // QUOTES (DEVIS) -> SUPABASE
+  // =========================
   const saveToArchive = async (quote: Quote) => {
     const q = safeJsonClone({ ...quote, updatedAt: new Date().toISOString() });
 
-    // local
+    // UI immédiate
     setArchives(prev => {
       const filtered = prev.filter(p => p.id !== q.id);
       return [q, ...filtered];
     });
 
-    // remote
-    if (sb) {
-      await sb.from('quotes').upsert({
-        id: q.id,
-        data: q,
-        updated_at: new Date().toISOString()
-      });
+    try {
+      setDbStatus("Quotes: saving...");
+      if (sb) {
+        const { error } = await sb.from('quotes').upsert({
+          id: q.id,
+          data: q,
+          updated_at: new Date().toISOString()
+        });
+        if (error) throw error;
+      }
+      await fetchFromSupabase();
+      setDbStatus("Quotes: OK");
+    } catch (e: any) {
+      console.error("[LalaJet] Quote upsert error:", e?.message || e);
+      setDbStatus("Quotes: ERROR");
     }
   };
 
   const deleteQuote = async (quoteId: string) => {
-    // local
+    // UI immédiate
     setArchives(prev => prev.filter(q => q.id !== quoteId));
 
-    // remote
-    if (sb) {
-      await sb.from('quotes').delete().eq('id', quoteId);
+    try {
+      setDbStatus("Quotes: deleting...");
+      if (sb) {
+        const { error } = await sb.from('quotes').delete().eq('id', quoteId);
+        if (error) throw error;
+      }
+      await fetchFromSupabase();
+      setDbStatus("Quotes: OK");
+    } catch (e: any) {
+      console.error("[LalaJet] Quote delete error:", e?.message || e);
+      setDbStatus("Quotes: ERROR");
     }
-
-    // refresh pour l'autre navigateur + toi
-    fetchFromSupabase().catch(() => {});
   };
 
   const toggleStatus = async (quoteId: string) => {
@@ -422,18 +404,27 @@ const App: React.FC = () => {
       type: "PRIVATE"
     };
 
-    setClients(prev => [newClient, ...prev]);
-
-    if (sb) {
-      await sb.from('clients').upsert({
-        id: newClient.id,
-        data: newClient,
-        updated_at: new Date().toISOString()
-      });
+    try {
+      setDbStatus("Clients: saving...");
+      if (sb) {
+        const { error } = await sb.from('clients').upsert({
+          id: newClient.id,
+          data: newClient,
+          updated_at: new Date().toISOString()
+        });
+        if (error) throw error;
+      }
+      await fetchFromSupabase();
+      setDbStatus("Clients: OK");
+    } catch (e: any) {
+      console.error("[LalaJet] client create error:", e?.message || e);
+      setDbStatus("Clients: ERROR");
     }
   };
 
-  // ---------------- UI ----------------
+  // =========================
+  // UI
+  // =========================
   if (!isAuthenticated) {
     return (
       <div style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', background: '#0b0f1a' }}>
@@ -463,8 +454,6 @@ const App: React.FC = () => {
 
   return (
     <div>
-      {/* Top bar / nav */}
-      {/* ⚠️ Je garde ton UI existante : adapte si besoin */}
       <div style={{ padding: 12, display: 'flex', gap: 12, alignItems: 'center' }}>
         <button onClick={() => setActiveTab('editor')}>Éditeur</button>
         <button onClick={() => setActiveTab('archives')}>Archives</button>
@@ -506,16 +495,16 @@ const App: React.FC = () => {
       {activeTab === 'clients' && (
         <ClientManager
           clients={clients}
-          setClients={setClients}
+          setClients={setClientsAndSync}
         />
       )}
 
       {activeTab === 'config' && (
         <CatalogManager
           config={config}
-          setConfig={setConfig}
+          setConfig={setConfigAndSync}
           catalog={catalog}
-          setCatalog={setCatalog}
+          setCatalog={setCatalogAndSync}
         />
       )}
     </div>
